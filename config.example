@@ -1,0 +1,21 @@
+# ~/.config/handoff/config  (sourced by bash)
+
+# ssh host of the always-on Mac. `ssh <host> true` must work without a prompt.
+HANDOFF_HOST=my-mac-mini
+
+# Path prefixes that differ between the machines, most specific first.
+# "local=remote" maps both ways; "local>remote" maps on the way out only.
+# A leading ~ is that machine's home. Home always maps to home, so most
+# setups need nothing here.
+# HANDOFF_PATHS=(
+#   "/Volumes/Work=~/Work"
+# )
+
+# Extra arguments for claude on the remote.
+# HANDOFF_CLAUDE_ARGS="--permission-mode auto"
+
+# Login shell on the remote (default zsh).
+# HANDOFF_REMOTE_SHELL=zsh
+
+# Refuse to sync a tree bigger than this many GB (default 5; --force skips).
+# HANDOFF_MAX_GB=5
