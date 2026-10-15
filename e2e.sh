@@ -10,6 +10,9 @@
 #
 #   ./e2e.sh                       E2E_DIR=~/handoff-e2e by default
 #   E2E_WT_DIR=/Volumes/X/wt ./e2e.sh   put the worktree somewhere else
+#   E2E_VIA=shell ./e2e.sh         self-handoff typed as `! handoff out ...` instead of
+#                                  asked of Claude in plain words (needs the skill installed)
+#   E2E_MODE=auto                  permission mode of the live session (default auto)
 # Output: a PASS/FAIL log in $E2E_DIR/logs/e2e-<timestamp>.log
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -20,6 +23,8 @@ WTREAL=${E2E_WT_DIR:-$E2E_DIR/worktrees}
 LINK=$HOME/.handoff-e2e-link            # symlink -> $WTREAL; session B's cwd goes through it
 WT=$LINK/wt1                            # logical cwd of session B
 export HANDOFF_STATE=$E2E_DIR/state     # separate from your real ~/.handoff
+export PATH=$(dirname "$H"):$PATH       # the live session's `handoff` is the one under test
+VIA=${E2E_VIA:-agent}
 mkdir -p "$E2E_DIR/logs"
 LOG=$E2E_DIR/logs/e2e-$(date +%Y%m%d-%H%M%S).log
 fails=0
@@ -56,7 +61,7 @@ A=$(cd "$REPO" && claude -p --model haiku --output-format json "Read note.txt; r
 A2=$(cd "$REPO" && claude -p --model haiku --output-format json "Reply only: ok" </dev/null | jq -r .session_id)
 B=$(cd "$WTREAL/wt1" && claude -p --model haiku --output-format json "Read wt.txt; reply only its contents." </dev/null | jq -r .session_id)
 echo "A=$A  A2=$A2  B=$B"
-tmux -L hotest new-session -d -s live -x 200 -y 50 -c "$REPO" "claude --resume $A"
+tmux -L hotest new-session -d -s live -x 200 -y 50 -c "$REPO" "claude --resume $A --permission-mode ${E2E_MODE:-auto}"
 sleep 6; tmux -L hotest send-keys -t live Down; sleep 0.5; tmux -L hotest send-keys -t live C-m   # folder-trust prompt
 # B stands in for a session whose recorded cwd is a symlinked path (Claude Code
 # records real paths for new sessions; older ones, or tools that cd through
@@ -76,9 +81,19 @@ check "guard left nothing on the remote" '! ls "$HANDOFF_STATE/out/" | grep -q .
 G=$("$H" out "$B" 2>&1); grc=$?; echo "guard said: $G"
 check "same-repo guard refuses B (other worktree) while A is live" '[ $grc -ne 0 ] && [[ "$G" == *"same repo"* ]]'
 
-# --- A hands itself AND B off from inside A (bash mode); A must be processed last
-sleep 2; tmux -L hotest send-keys -t live -l "!"; sleep 1; tmux -L hotest send-keys -t live -l "$H out $A $B"; sleep 1; tmux -L hotest send-keys -t live C-m
-for _ in $(seq 1 60); do [ -f "$HANDOFF_STATE/out/$A" ] && grep -q "running on" "$HANDOFF_STATE/log/$A.log" 2>/dev/null && remote "tmux has-session -t ho-${A:0:8}" && break; sleep 2; done
+# --- A hands itself AND B off from inside A; A must be processed last
+sleep 2
+if [ "$VIA" = agent ]; then   # plain words; the handoff skill has to do the rest
+  tmux -L hotest send-keys -t live -l "I'm heading out. Hand this session and the session wt1-symlinked off to the remote."
+else
+  tmux -L hotest send-keys -t live -l "!"; sleep 1; tmux -L hotest send-keys -t live -l "$H out $A $B"
+fi
+sleep 1; tmux -L hotest send-keys -t live C-m
+for _ in $(seq 1 90); do [ -f "$HANDOFF_STATE/out/$A" ] && grep -q "running on" "$HANDOFF_STATE/log/$A.log" 2>/dev/null && remote "tmux has-session -t ho-${A:0:8}" && break; sleep 2; done
+[ -f "$HANDOFF_STATE/out/$A" ] || { echo "--- live pane"; tmux -L hotest capture-pane -p -S -40 -t live 2>/dev/null; echo "---"; }
+if [ "$VIA" = agent ]; then
+  check "agent: Claude ran handoff out itself (Bash tool call in A's transcript)" 'jq -r "select(.type==\"assistant\") | .message.content[]? | select(.type==\"tool_use\" and .name==\"Bash\") | .input.command" ~/.claude/projects/$(enc "$REPO")/$A.jsonl 2>/dev/null | grep -q "handoff out"'
+fi
 check "self-handoff: A recorded as on the remote" '[ -f "$HANDOFF_STATE/out/$A" ]'
 check "self-handoff: laptop process for A stopped" '! kill -0 "$APID" 2>/dev/null'
 check "self-handoff: A runs on the remote" 'remote "tmux has-session -t ho-${A:0:8}"'

@@ -1,0 +1,15 @@
+{
+  "name": "claude-handoff",
+  "owner": {
+    "name": "Zay Cruz",
+    "url": "https://github.com/zaycruz"
+  },
+  "description": "Hand Claude Code sessions from your laptop to an always-on Mac and back",
+  "plugins": [
+    {
+      "name": "handoff",
+      "source": "./",
+      "description": "Hand Claude Code sessions to an always-on Mac and back"
+    }
+  ]
+}

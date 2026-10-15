@@ -17,5 +17,8 @@ HANDOFF_HOST=my-mac-mini
 # Login shell on the remote (default zsh).
 # HANDOFF_REMOTE_SHELL=zsh
 
+# Most sessions on the remote at once (default 8; each is ~0.5 GB).
+# HANDOFF_MAX_SESSIONS=8
+
 # Refuse to sync a tree bigger than this many GB (default 5; --force skips).
 # HANDOFF_MAX_GB=5

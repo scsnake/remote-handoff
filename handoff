@@ -4,7 +4,8 @@
 # the Claude app on your phone through Remote Control.
 #
 #   handoff list                    live laptop sessions, plus sessions on the remote
-#   handoff out <sid|name>... [--force]
+#   handoff out <sid|name|self>... [--force]
+#                                   (self = the Claude session running this command)
 #                                   stop on the laptop, sync repo + transcript, resume on
 #                                   the remote in tmux with Remote Control on
 #   handoff in [sid...] [--force]   stop on the remote, sync back, print the resume command
@@ -70,8 +71,15 @@ live_sessions() {   # sid<TAB>pid<TAB>name<TAB>status<TAB>cwd, newest first
   done | sort -rn | cut -f2-
 }
 
-resolve_sid() {     # accepts a session id, id prefix, or session name
+resolve_sid() {     # accepts a session id, id prefix, session name, or "self"
   local a=$1 hit
+  if [ "$a" = self ]; then   # the Claude Code session whose Bash tool (or ! prompt) runs us
+    hit=$(live_sessions | while IFS=$'\t' read -r s p _; do
+      if [ "$s" = "${CLAUDE_CODE_SESSION_ID:-}" ] || is_ancestor "$p"; then echo "$s"; break; fi
+    done)
+    [ -n "$hit" ] && { echo "$hit"; return; }
+    die "self: not running inside a live Claude Code session"
+  fi
   hit=$(live_sessions | awk -F'\t' -v a="$a" '$1==a || $3==a || index($1,a)==1 {print $1}' | head -2)
   [ "$(printf '%s\n' "$hit" | grep -c .)" -gt 1 ] && die "'$a' matches more than one session"
   [ -n "$hit" ] && { echo "$hit"; return; }
@@ -85,7 +93,11 @@ cmd_out() {
   for a in "$@"; do
     if [ "$a" = --force ]; then force=1; else s=$(resolve_sid "$a") || exit 1; sids+=("$s"); fi
   done
-  [ ${#sids[@]} -gt 0 ] || die "usage: handoff out <sid|name>... [--force]"
+  [ ${#sids[@]} -gt 0 ] || die "usage: handoff out <sid|name|self>... [--force]"
+  if [ "$force" = 0 ]; then   # each session is ~0.5 GB on the remote
+    local have; have=$(ls "$STATE/out" | grep -c . || true)
+    [ $(( have + ${#sids[@]} )) -gt "${HANDOFF_MAX_SESSIONS:-8}" ] && die "$HOST would run $(( have + ${#sids[@]} )) sessions (limit HANDOFF_MAX_SESSIONS=${HANDOFF_MAX_SESSIONS:-8}); hand off fewer or pass --force"
+  fi
   BATCH=" ${sids[*]} "   # sessions handed out together may share a tree
   local ordered=() me="" p
   for sid in "${sids[@]}"; do
@@ -136,20 +148,19 @@ out_one() {
   mroot=$(mfwd "$root"); [ -n "$common" ] && mcommon=$(mfwd "$common")
 
   log "$name ($sid)"
+  if [ -n "$pid" ] && is_ancestor "$pid"; then   # handing off the session that ran us: finish detached
+    log "  this is the current session; it stops in a few seconds and resumes on $HOST"
+    log "  progress: $STATE/log/$sid.log"
+    # own session (setsid) so stopping the parent claude does not take us with it; detach
+    # before the slow sync so a Bash tool call returns at once and its result is saved
+    HANDOFF_DETACHED=1 nohup python3 -c 'import os,sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
+      "$0" _out_finish "$sid" "$pid" "$name" "$cwd" "$root" "$common" "$tx" \
+      </dev/null >"$STATE/log/$sid.log" 2>&1 &
+    disown; return
+  fi
   log "  sync $root -> $HOST:$mroot (warm copy, session still running)"
   sync_to_remote "$root" "$mroot" "$common" "$mcommon"
-
-  if [ -n "$pid" ]; then
-    if is_ancestor "$pid"; then   # handing off the session that ran us: finish detached
-      log "  this is the current session; finishing in the background (log: $STATE/log/$sid.log)"
-      # own session (setsid) so stopping the parent claude does not take us with it
-      HANDOFF_DETACHED=1 nohup python3 -c 'import os,sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
-        "$0" _out_finish "$sid" "$pid" "$name" "$cwd" "$root" "$common" "$tx" \
-        </dev/null >"$STATE/log/$sid.log" 2>&1 &
-      disown; return
-    fi
-    stop_pid "$pid"
-  fi
+  [ -n "$pid" ] && stop_pid "$pid"
   finish_out "$sid" "$name" "$cwd" "$root" "$common" "$tx"
 }
 
@@ -328,7 +339,11 @@ case "${1:-}" in
   status|st) [ -n "$HOST" ] || die "set HANDOFF_HOST in $CONFIG"; cmd_status ;;
   out) shift; setup_paths; cmd_out "$@" ;;
   in) shift; setup_paths; cmd_in "$@" ;;
-  _out_finish) shift; setup_paths; stop_pid "$2"; finish_out "$1" "$3" "$4" "$5" "$6" "$7" ;;
+  _out_finish) shift; setup_paths
+    log "  sync $5 -> $HOST (warm copy, session still running)"
+    sync_to_remote "$5" "$(mfwd "$5")" "$6" "$( [ -n "$6" ] && mfwd "$6")"
+    sleep "${HANDOFF_SELF_DELAY:-3}"   # let the calling tool call finish and land in the transcript
+    stop_pid "$2"; finish_out "$1" "$3" "$4" "$5" "$6" "$7" ;;
   _paths) setup_paths; shift; for p in "$@"; do printf '%s -> %s -> %s\n' "$p" "$(mfwd "$p")" "$(mfwd "$p" | back)"; done ;;
-  *) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  *) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac
