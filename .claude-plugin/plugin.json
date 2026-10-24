@@ -1,9 +1,9 @@
 {
   "name": "handoff",
-  "version": "0.2.0",
-  "description": "Hand live Claude Code sessions from your laptop to an always-on Mac, keep going on your phone with Remote Control, and hand them back. Say \"I'm heading out\" and Claude hands itself off.",
-  "author": { "name": "Zay Cruz", "url": "https://github.com/zaycruz" },
-  "repository": "https://github.com/zaycruz/claude-handoff",
+  "version": "0.3.0",
+  "description": "Hand live Claude Code and Codex sessions from your laptop to an always-on remote host, keep going there, and hand them back. Say \"I'm heading out\" and the agent hands itself off. Fork of zaycruz/claude-handoff by Zay Cruz.",
+  "author": { "name": "scsnake", "url": "https://github.com/scsnake" },
+  "repository": "https://github.com/scsnake/claude-handoff",
   "license": "MIT",
-  "keywords": ["handoff", "remote-control", "mac-mini", "tmux", "mobile"]
+  "keywords": ["handoff", "remote-control", "remote-host", "ssh", "tmux", "codex"]
 }

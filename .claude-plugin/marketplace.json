@@ -1,15 +1,15 @@
 {
   "name": "claude-handoff",
   "owner": {
-    "name": "Zay Cruz",
-    "url": "https://github.com/zaycruz"
+    "name": "scsnake",
+    "url": "https://github.com/scsnake"
   },
-  "description": "Hand Claude Code sessions from your laptop to an always-on Mac and back",
+  "description": "Hand Claude Code and Codex sessions from your laptop to an always-on remote host and back. Fork of zaycruz/claude-handoff by Zay Cruz.",
   "plugins": [
     {
       "name": "handoff",
       "source": "./",
-      "description": "Hand Claude Code sessions to an always-on Mac and back"
+      "description": "Hand Claude Code and Codex sessions to an always-on remote host and back"
     }
   ]
 }
