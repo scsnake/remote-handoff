@@ -23,6 +23,8 @@ WTREAL=${E2E_WT_DIR:-$E2E_DIR/worktrees}
 LINK=$HOME/.handoff-e2e-link            # symlink -> $WTREAL; session B's cwd goes through it
 WT=$LINK/wt1                            # logical cwd of session B
 export HANDOFF_STATE=$E2E_DIR/state     # separate from your real ~/.handoff
+export HANDOFF_ROOT=${E2E_ROOT:-"~/handoff-e2e-root"}   # own mirror root on the remote, removed at the end
+export HANDOFF_MAX_AGE_DAYS=0
 export PATH=$(dirname "$H"):$PATH       # the live session's `handoff` is the one under test
 VIA=${E2E_VIA:-agent}
 mkdir -p "$E2E_DIR/logs"
@@ -31,21 +33,25 @@ fails=0
 exec > >(tee "$LOG") 2>&1
 check() { if ( set +o pipefail; eval "$2" ); then echo "PASS  $1"; else echo "FAIL  $1"; fails=$((fails+1)); fi; }
 CONFIG=${HANDOFF_CONFIG:-$HOME/.config/handoff/config}; [ -f "$CONFIG" ] && . "$CONFIG"
+export HANDOFF_ROOT=${E2E_ROOT:-"~/handoff-e2e-root"} HANDOFF_MAX_AGE_DAYS=0   # again: the config file must not win
 HOST=${HANDOFF_HOST:?set HANDOFF_HOST in $CONFIG}
-eval "$(sed -n '/^# Tailscale SSH/,/^}/p' "$H")"   # msh: real exit codes over ssh
+eval "$(sed -n '/^# Tailscale SSH/,/^# --- path mapping/p' "$H")"   # msh/mshi: real exit codes over ssh
 remote() { msh "$@"; }
 rpath() { "$H" _paths "$1" | awk -F' -> ' '{print $2}'; }   # laptop path -> remote path
 ask() { claude -p --model haiku --output-format json --resume "$1" "$2" </dev/null | jq -r .result; }
 enc() { printf '%s' "$1" | sed 's/[^a-zA-Z0-9]/-/g'; }
 remote_clean() {   # no globs: the remote login shell may be zsh, which aborts on no match
-  remote "rm -rf $(printf %q "$RREPO") $(printf %q "$RWT") ~/.handoff-e2e-link; find ~/.claude/projects -maxdepth 1 \\( -name $(printf %q "$(enc "$RREPO")*") -o -name $(printf %q "$(enc "$RWT")*") -o -name $(printf %q "$(enc "$RH/.handoff-e2e-link")*") \\) -exec rm -rf {} +"
+  case "$RROOT" in *e2e*) ;; *) echo "FAIL  refusing to clean root $RROOT (no 'e2e' in it)"; exit 1 ;; esac
+  remote "rm -rf $(printf %q "$RROOT") ~/.handoff-e2e-link; find ~/.claude/projects -maxdepth 1 \\( -name $(printf %q "$(enc "$RREPO")*") -o -name $(printf %q "$(enc "$RWT")*") -o -name $(printf %q "$(enc "$RH/.handoff-e2e-link")*") \\) -exec rm -rf {} +"
 }
 type_in() { remote "tmux send-keys -t $1 -l $(printf %q "$2"); sleep 1; tmux send-keys -t $1 C-m"; }
 
 echo "handoff e2e  $(date -u +%FT%TZ)  host=$HOST"
 RH=$(rpath "$HOME"); RREPO=$(rpath "$REPO"); RWT=$(rpath "$WTREAL")
 [ -n "$RH" ] || { echo "FAIL  cannot reach $HOST"; exit 1; }
-echo "remote home=$RH  repo=$RREPO  worktrees=$RWT"
+RROOT=${HANDOFF_ROOT/#\~/$RH}
+echo "remote home=$RH  root=$RROOT  repo=$RREPO  worktrees=$RWT"
+case "$RREPO" in "$RROOT"/*) ;; *) echo "FAIL  repo does not map under the root ($RREPO)"; exit 1 ;; esac
 
 # --- clean slate (only our own dirs)
 remote_clean
@@ -53,7 +59,10 @@ remote "mkdir -p ~/.handoff-e2e-link && ln -s /tmp ~/.handoff-e2e-link/wt1"   # 
 tmux -L hotest kill-server 2>/dev/null
 git -C "$REPO" worktree remove --force "$WTREAL/wt1" 2>/dev/null; rm -rf "$REPO" "$WTREAL" "$LINK" "$HANDOFF_STATE"
 mkdir -p "$REPO" "$WTREAL" && ln -s "$WTREAL" "$LINK"
-cd "$REPO" && git init -q && echo laptop-v1 > note.txt && git add -A && git -c user.email=t@t -c user.name=t commit -qm init
+cd "$REPO" && git init -q && echo laptop-v1 > note.txt && printf 'big.bin\n' > .gitignore && git add -A && git -c user.email=t@t -c user.name=t commit -qm init
+dd if=/dev/zero of=big.bin bs=1024 count=2048 2>/dev/null                   # ignored: must stay on the laptop
+mkdir -p "$E2E_DIR/outside/skill" .claude/skills && echo outside > "$E2E_DIR/outside/skill/SKILL.md"
+ln -s "$E2E_DIR/outside/skill" .claude/skills/linked                       # leaves the tree: sent as a copy
 git worktree add -q "$WTREAL/wt1" -b wt1 && echo wt-laptop-v1 > "$WTREAL/wt1/wt.txt"
 
 # --- sessions: A (repo, live), A2 (repo, transcript only), B (worktree via symlink)
@@ -81,6 +90,11 @@ check "guard left nothing on the remote" '! ls "$HANDOFF_STATE/out/" | grep -q .
 G=$("$H" out "$B" 2>&1); grc=$?; echo "guard said: $G"
 check "same-repo guard refuses B (other worktree) while A is live" '[ $grc -ne 0 ] && [[ "$G" == *"same repo"* ]]'
 
+# --- dry run: reports, changes nothing
+D=$("$H" out "$A2" --dry-run --force 2>&1); echo "$D" | sed -n '1,12p'
+check "dry run reports the transfer" '[[ "$D" == *"would send"* ]] && [[ "$D" == *"dry run"* ]]'
+check "dry run left nothing on the remote" '! ls "$HANDOFF_STATE/out/" | grep -q . && ! remote "test -e $(printf %q "$RREPO/note.txt")"'
+
 # --- A hands itself AND B off from inside A; A must be processed last
 sleep 2
 if [ "$VIA" = agent ]; then   # plain words; the handoff skill has to do the rest
@@ -105,6 +119,9 @@ sleep 10
 check "Remote Control active for A" 'remote "tmux capture-pane -p -t ho-${A:0:8}" | grep -q "remote-control is active"'
 check "Remote Control active for B" 'remote "tmux capture-pane -p -t ho-${B:0:8}" | grep -q "remote-control is active"'
 check "B logical path on the remote links to its tree (stale link replaced)" '[ "$(remote "readlink ~/.handoff-e2e-link/wt1")" = "$RWT/wt1" ]'
+check "ignored big.bin not sent" '! remote "test -e $(printf %q "$RREPO/big.bin")"'
+check "outside symlink sent as a real dir" 'remote "test -d $(printf %q "$RREPO/.claude/skills/linked") && ! test -L $(printf %q "$RREPO/.claude/skills/linked")"'
+check "mirror stamped" '"$H" mirrors | grep -q "$RREPO"'
 check "worktree .git points at the remote path" 'remote "cat $(printf %q "$RWT/wt1/.git")" | grep -q "$RREPO/.git/worktrees/wt1"'
 
 # --- work on the remote (stands in for the phone)
@@ -133,6 +150,10 @@ check "laptop note.txt = mini-v2" 'grep -q mini-v2 "$REPO/note.txt"'
 check "laptop worktree has from-mini commit" 'git -C "$WTREAL/wt1" log --oneline | grep -q from-mini'
 check "laptop worktree .git points at laptop path" 'grep -q "^gitdir: $REPO/.git/worktrees/wt1" "$WTREAL/wt1/.git"'
 check "laptop symlink still a symlink" '[ -L "$LINK" ]'
+check "ignored big.bin still on the laptop" '[ -f "$REPO/big.bin" ]'
+check "outside symlink still a symlink on the laptop" '[ -L "$REPO/.claude/skills/linked" ]'
+check "remote transcript removed after in" '! remote "test -e $(printf %q "$RH/.claude/projects/$(enc "$RREPO")/$A.jsonl")"'
+check "no root paths left in transcripts" '! grep -q "$RROOT/" ~/.claude/projects/$(enc "$REPO")/$A.jsonl ~/.claude/projects/$(enc "$WTREAL/wt1")/$B.jsonl'
 if [ "$RH" != "$HOME" ]; then
   check "no remote paths left in transcripts" '! grep -q "$RH/" ~/.claude/projects/$(enc "$REPO")/$A.jsonl ~/.claude/projects/$(enc "$WTREAL/wt1")/$B.jsonl'
 fi

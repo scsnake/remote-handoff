@@ -1,41 +1,103 @@
 #!/bin/bash
-# handoff: move live Claude Code sessions from this laptop to an always-on Mac
-# (say, a Mac mini) and back, so you can close the laptop and keep going from
-# the Claude app on your phone through Remote Control.
+# handoff: move live Claude Code or Codex CLI sessions from this laptop to an
+# always-on host and back, so you can close the laptop and keep going (Claude:
+# from the Claude app on your phone through Remote Control).
 #
 #   handoff list                    live laptop sessions, plus sessions on the remote
 #   handoff out <sid|name|self>... [--force]
-#                                   (self = the Claude session running this command)
+#                                   (self = the Claude or Codex session running this command)
 #                                   stop on the laptop, sync repo + transcript, resume on
-#                                   the remote in tmux with Remote Control on
+#                                   the remote in tmux (Claude: with Remote Control on)
 #   handoff in [sid...] [--force]   stop on the remote, sync back, print the resume command
 #                                   (no args = every session currently on the remote)
 #   handoff status                  what the remote owns right now
+#   handoff wait [sid...] [--timeout S]
+#                                   block until the remote sessions wrote .handoff/FINISH.md
+#                                   and are idle (then run `handoff in`)
+#   handoff back <sid|self> [--prompt TEXT] [--args FLAGS] [--timeout S]
+#                                   detached: wait, then `in`, then resume the session here
+#                                   in tmux ho-back-<id> (with TEXT as its next prompt)
+#   handoff doctor [claude|codex]   check this laptop, the remote and the agent CLIs
+#   handoff mirrors                 synced trees kept on the remote, with last use
+#   handoff prune [--max-age N] [--dry-run]
+#                                   delete mirrors not used for N days (HANDOFF_MAX_AGE_DAYS)
+#
+#   out also takes --dry-run (show what would be sent, change nothing) and --yes
+#   (send even when the transfer is over HANDOFF_WARN_MB).
 #
 # Config: ~/.config/handoff/config (see config.example). HANDOFF_HOST is required.
 set -euo pipefail
 
 CONFIG=${HANDOFF_CONFIG:-$HOME/.config/handoff/config}
+_env=$(export -p | grep -E '^(declare -x|export) HANDOFF_' || true)
 [ -f "$CONFIG" ] && . "$CONFIG"
+eval "$_env"   # exported HANDOFF_* win over the file (e2e.sh relies on this)
 HOST=${HANDOFF_HOST:-}
 STATE=${HANDOFF_STATE:-$HOME/.handoff}
 mkdir -p "$STATE/out" "$STATE/backup" "$STATE/log"
 
+# rsync 3.x only. macOS ships openrsync as /usr/bin/rsync: it ignores the filter rules
+# that protect unsent laptop files from --delete on `in`, and its --backup-dir fails.
+# HANDOFF_RSYNC points at another binary (e.g. /opt/homebrew/bin/rsync).
+rsync() {          # retry when ssh drops (255) or the stream breaks (12); rsync is safe to rerun
+  local try rc
+  for try in 1 2 3 4; do
+    rc=0; command "${HANDOFF_RSYNC:-rsync}" "$@" || rc=$?
+    case $rc in 12|255) [ "$try" = 4 ] || { printf 'handoff: rsync failed (%s); retry %s/3\n' "$rc" "$try" >&2; sleep $((try * 5)); continue; } ;; esac
+    return $rc
+  done
+}
+need_rsync3() {     # no `| head`: under pipefail its early close fails the pipe
+  local v; v=$(rsync --version 2>&1 || true); v=${v%%$'\n'*}
+  [[ "$v" =~ ^rsync\ +version\ 3\. ]] \
+    || die "needs rsync 3.x; $(command -v "${HANDOFF_RSYNC:-rsync}") is '$v'. Install it (brew install rsync) or set HANDOFF_RSYNC"
+}
+
+# Run "$@" in its own session, already detached when this returns. A Codex shell
+# command kills its process group when it ends, so setsid must happen before that:
+# the parent waits until the child has called it.
+detach() {
+  python3 -c 'import os, sys
+r, w = os.pipe()
+if os.fork() == 0:
+    os.close(r); os.setsid(); os.close(w)
+    os.execvp(sys.argv[1], sys.argv[1:])
+os.close(w); os.read(r, 1)' "$@"
+}
 log() { printf '\033[1m==>\033[0m %s\n' "$*"; }
 die() { printf 'handoff: %s\n' "$*" >&2; exit 1; }
-EXCLUDES=(--exclude=.beads/ --exclude=.DS_Store)   # .beads: per-machine issue DB, never synced
+DRY=0 YES=0
 enc() { printf '%s' "$1" | sed 's/[^a-zA-Z0-9]/-/g'; }   # Claude's projects/ dir naming
 
-# Tailscale SSH always exits 0, so the remote side reports its real
-# exit code on stderr and msh returns it. stdout stays clean for data copies.
-msh() {
-  local err rc
-  err=$(mktemp)
-  ssh -o BatchMode=yes "$HOST" "export PATH=/opt/homebrew/bin:/usr/local/bin:\$HOME/.local/bin:\$PATH; $*
-__rc=\$?; echo __HANDOFF_RC=\$__rc >&2" 2>"$err" || true
-  rc=$(sed -n 's/^__HANDOFF_RC=//p' "$err" | tail -1)
+# Tailscale SSH always exits 0, so the remote side reports its real exit code
+# on stderr and msh returns it. A dropped connection (no exit code came back) is
+# retried: every remote step is safe to run again. stdout is held until the call
+# ends, so a retry never doubles a data copy. msh gives the remote no stdin (it
+# would eat the caller's `while read` input); mshi sends its own stdin.
+msh() { _msh /dev/null "$@"; }
+mshi() {
+  local in rc=0
+  in=$(mktemp); cat > "$in"
+  _msh "$in" "$@" || rc=$?
+  rm -f "$in"; return $rc
+}
+_msh() {
+  local in=$1 out err rc try
+  shift
+  out=$(mktemp); err=$(mktemp)
+  for try in 1 2 3 4; do
+    ssh -o BatchMode=yes -o ConnectTimeout=15 "$HOST" "export PATH=/opt/homebrew/bin:/usr/local/bin:\$HOME/.local/bin:\$PATH; (
+$*
+)
+__rc=\$?; echo __HANDOFF_RC=\$__rc >&2" <"$in" >"$out" 2>"$err" || true
+    rc=$(sed -n 's/^__HANDOFF_RC=//p' "$err" | tail -1)
+    [ -n "$rc" ] || [ "$try" = 4 ] && break
+    printf 'handoff: ssh to %s failed (%s); retry %s/3\n' "$HOST" "$(tail -1 "$err")" "$try" >&2
+    sleep $((try * 5))
+  done
+  cat "$out"
   grep -v '^__HANDOFF_RC=' "$err" >&2 || true
-  rm -f "$err"
+  rm -f "$out" "$err"
   return "${rc:-255}"
 }
 
@@ -44,6 +106,15 @@ __rc=\$?; echo __HANDOFF_RC=\$__rc >&2" 2>"$err" || true
 # git worktree links are rewritten on the way out and back. Home always maps to
 # home; HANDOFF_PATHS adds prefixes ("local=remote", or "local>remote" one-way),
 # most specific first. A leading ~ means that machine's home.
+#
+# Root mode (HANDOFF_ROOT, default ~/handoff; set it empty to turn it off): each
+# synced tree lands at $R_ROOT/<its path relative to the laptop home> instead of
+# the same path under the remote home, so a handoff can never rsync --delete over
+# a real checkout that already lives on the remote. Everything else in the
+# transcript still maps home to home.
+# Escape a path for the s#..#..# rules (BSD and GNU sed disagree on \ inside [], so no sed here).
+rxp() { local s=$1 c; for c in '\' '[' ']' '.' '*' '^' '$' '#'; do s=${s//"$c"/"\\$c"}; done; printf '%s' "$s"; }
+rxr() { local s=$1 c; for c in '\' '&' '#'; do s=${s//"$c"/"\\$c"}; done; printf '%s' "$s"; }
 setup_paths() {
   [ -n "$HOST" ] || die "set HANDOFF_HOST in $CONFIG (see config.example)"
   R_HOME=${HANDOFF_REMOTE_HOME:-$(msh 'printf %s "$HOME"')} || die "cannot reach $HOST over ssh"
@@ -53,37 +124,185 @@ setup_paths() {
   for p in ${HANDOFF_PATHS[@]+"${HANDOFF_PATHS[@]}"} "~=~"; do
     if [[ "$p" == *'>'* ]]; then l=${p%%>*}; r=${p#*>}; oneway=1; else l=${p%%=*}; r=${p#*=}; oneway=0; fi
     l=${l/#\~/$HOME}; r=${r/#\~/$R_HOME}
-    FWD+=(-e "s#$l#$r#g")
-    [ $oneway = 1 ] || BACK+=(-e "s#$r#$l#g")
+    FWD+=(-e "s#$(rxp "$l")#$(rxr "$r")#g")
+    [ $oneway = 1 ] || BACK+=(-e "s#$(rxp "$r")#$(rxr "$l")#g")
   done
+  R_ROOT=""
+  local hr=${HANDOFF_ROOT-"~/handoff"}
+  if [ -n "$hr" ]; then
+    hr=${hr/#\~/$R_HOME}
+    R_ROOT=$(msh "mkdir -p $(printf %q "$hr") && cd $(printf %q "$hr") && pwd -P") || die "cannot create $hr on $HOST"
+    # fallback on the way back for mirrors of other sessions a transcript mentions
+    BACK=(-e "s#$(rxp "$R_ROOT")/#$(rxr "$HOME")/#g" "${BACK[@]}")
+  fi
+}
+map_tree() {        # root mode: route these laptop paths (a tree, its shared .git) under $R_ROOT
+  [ -n "$R_ROOT" ] || return 0
+  local p r
+  for p in "$@"; do
+    [ -n "$p" ] || continue
+    case "$p" in "$HOME"/*) r=$R_ROOT/${p#"$HOME"/} ;; *) r=$R_ROOT/${p#/} ;; esac
+    FWD=(-e "s#$(rxp "$p")#$(rxr "$r")#g" "${FWD[@]}")
+    BACK=(-e "s#$(rxp "$r")#$(rxr "$p")#g" "${BACK[@]}")
+  done
+}
+
+# --- what gets synced ----------------------------------------------------------
+# Rules for one tree, first match wins: .handoff/filter (task-specific, written by
+# the agent before out: "- /data/raw/" skips, "+ /fixtures/***" sends an ignored
+# path), then every .gitignore (HANDOFF_GITIGNORE=0 turns that off). The same rules
+# apply on the way back, so `in` never deletes laptop files that were never sent.
+tree_filter() {
+  FILTER=(--exclude=.beads/ --exclude=.DS_Store)   # .beads: per-machine issue DB, never synced
+  [ -f "$1/.handoff/filter" ] && FILTER+=(--filter="merge $1/.handoff/filter")
+  [ "${HANDOFF_GITIGNORE:-1}" = 1 ] && FILTER+=(--filter=':- .gitignore')
+  return 0
+}
+outside_links() {   # symlinks in the tree that point out of it (e.g. linked skills), relative
+  local l
+  find "$1" -path "$1/.git" -prune -o -type l -print | while IFS= read -r l; do
+    case "$(realpath "$l" 2>/dev/null)" in "$1"/*) ;; *) printf '%s\n' "${l#"$1"}" ;; esac
+  done
+}
+mirror_key() { enc "$1"; }   # stamp name for a remote mirror path
+
+# Dry-run the sync of one tree, print the biggest items when it is large (or always
+# with --dry-run), and stop above HANDOFF_WARN_MB unless --yes. Also checks free space.
+# Sums %l itself rather than parsing --stats, and avoids --mkpath (needs rsync 3.2.3).
+check_size() {      # root mroot
+  local out bytes mb free dest="$HOST:$2/" empty=""
+  if ! msh "test -d $(printf %q "$2")" 2>/dev/null; then   # first out: measure against nothing
+    empty=$(mktemp -d); dest="$empty/"
+  fi
+  out=$(rsync -a --copy-unsafe-links --delete -n --out-format='%l %n' "${FILTER[@]}" "$1/" "$dest")
+  [ -n "$empty" ] && rmdir "$empty"
+  bytes=$(printf '%s\n' "$out" | awk '/^[0-9]+ / && !/\/$/ {s += $1} END {printf "%d", s}')
+  mb=$(( bytes / 1048576 ))
+  free=$(msh "df -Pk $(printf %q "${R_ROOT:-$R_HOME}") | awk 'NR==2 {print \$4}'")
+  [ $(( bytes / 1024 )) -lt "${free:-0}" ] || die "$HOST has $(( ${free:-0} / 1024 )) MB free at $2; this sync needs $mb MB"
+  if [ "$DRY" = 0 ] && [ "$mb" -lt "${HANDOFF_WARN_MB:-500}" ]; then return 0; fi
+  log "  would send $(printf '%s\n' "$out" | grep -E '^[0-9]+ ' | grep -cv '/$' || true) files, $(( bytes / 1024 )) KB to $HOST:$2 (limit ${HANDOFF_WARN_MB:-500} MB)"
+  printf '%s\n' "$out" | grep -E '^[0-9]+ ' | grep -v '/$' | sort -rn | head -8 \
+    | awk '{printf "      %8.1f MB  %s\n", $1/1048576, substr($0, index($0, " ") + 1)}'
+  [ "$DRY" = 1 ] && return 0
+  [ "$YES" = 1 ] && return 0
+  die "$1 would send $mb MB. Skip big paths in .handoff/filter or .gitignore, check with --dry-run, or pass --yes"
 }
 fwd() { sed "${FWD[@]}"; }
 back() { sed "${BACK[@]}"; }
 mfwd() { printf '%s' "$1" | fwd; }
 
+# --- agents --------------------------------------------------------------------
+# A session belongs to Claude Code or to the Codex CLI; the transcript tells which.
+# Codex (0.164) runs a TUI thread inside a shared app-server daemon: the TUI is only
+# a client, tool commands are children of the daemon (not of the TUI), and the daemon
+# keeps ~/.codex/thread-writer-locks/<id>.lock while the thread is loaded, even after
+# the TUI quits. So a live Codex session here is a codex client process, and the
+# session that runs us is known from CODEX_THREAD_ID only. On the remote, codex runs
+# with --no-daemon: killing its tmux then ends the session for real.
+CXH=${CODEX_HOME:-$HOME/.codex}
+claude_tx() { ls "$HOME"/.claude/projects/*/"$1".jsonl 2>/dev/null | head -1; }
+codex_tx() { ls "$CXH"/sessions/*/*/*/rollout-*-"$1".jsonl 2>/dev/null | head -1; }
+agent_of() {        # sid -> claude|codex
+  [ -n "$(claude_tx "$1")" ] && { echo claude; return; }
+  [ -n "$(codex_tx "$1")" ] && { echo codex; return; }
+  return 1
+}
+codex_held() {      # is the writer lock of this thread held (a lock file can outlive its holder)
+  local l=$CXH/thread-writer-locks/$1.lock
+  [ -e "$l" ] && lsof -t "$l" >/dev/null 2>&1
+}
+codex_cwd() {       # the cwd a rollout ran in last (resume -C may have moved it)
+  jq -r 'select(.type=="session_meta" or .type=="turn_context") | .payload.cwd // empty' "$1" 2>/dev/null | tail -1
+}
+proc_cwd() {
+  if [ -d /proc/self ]; then readlink "/proc/$1/cwd" 2>/dev/null
+  else lsof -a -p "$1" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1; fi
+}
+# Short id for names and output. Codex ids are UUIDv7: the first 8 hex digits are a
+# timestamp that sessions made a minute apart share, so they get the last 4 too.
+sid8() { case "$1" in ????????-????-7*) printf '%s-%s' "${1:0:8}" "${1: -4}" ;; *) printf '%s' "${1:0:8}" ;; esac; }
+out_file() {        # state file for a full id, a prefix or a short id; one match only
+  local f b m=""
+  for f in "$STATE"/out/*; do
+    [ -e "$f" ] || continue; b=${f##*/}
+    case "$b" in "$1"*) m+="$f"$'\n' ;; *) [ "$(sid8 "$b")" = "$1" ] && m+="$f"$'\n' ;; esac
+  done
+  [ -n "$m" ] || return 1
+  [ "$(printf '%s' "$m" | grep -c .)" -eq 1 ] || die "'$1' matches more than one session on $HOST; use more of the id"
+  printf '%s' "${m%$'\n'}"
+}
+UUID_RE='[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+codex_clients() {   # pid<TAB>kind<TAB>id-from-args or -<TAB>cwd for each codex TUI/exec client
+  # (never an empty field: `read` with IFS=tab merges two tabs and shifts the rest)
+  ps -eo pid=,args= 2>/dev/null | while read -r pid a0 rest; do
+    case "${a0##*/}" in codex|codex-x86_64-*|codex-aarch64-*) ;; *) continue ;; esac   # not codex-code-mode-host etc.
+    case " $rest " in *" app-server "*|*" remote-control "*|*" mcp"*|*" login "*|*" logout "*|*" delete "*|*" sandbox "*|*" queue "*|*" agents "*|*" cloud "*|*" completion "*|*" update "*|*" features "*|*" debug "*) continue ;; esac
+    local kind=tui id="" t toks; case " $rest " in *" exec "*) kind=exec ;; esac
+    read -ra toks <<<"$rest"   # no glob expansion of prompt text
+    for t in ${toks[@]+"${toks[@]}"}; do [[ "$t" =~ ^$UUID_RE$ ]] && { id=$t; break; }; done   # a whole argument, not part of a path
+    printf '%s\t%s\t%s\t%s\n' "$pid" "$kind" "${id:--}" "$(proc_cwd "$pid")"
+  done
+}
+codex_live() {      # rows like live_sessions for Codex; a client started without an id
+  # maps to the newest rollout with a writer lock and the same cwd
+  [ -d "$CXH/sessions" ] || return 0
+  local locked="" l f
+  for l in "$CXH"/thread-writer-locks/*.lock; do
+    [ -e "$l" ] || continue; l=${l##*/}; l=${l%.lock}
+    codex_held "$l" || continue
+    f=$(codex_tx "$l") && [ -n "$f" ] && locked+="$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f")"$'\t'"$l"$'\t'"$(codex_cwd "$f")"$'\n'
+  done
+  codex_clients | while IFS=$'\t' read -r pid kind id cwd; do
+    [ -n "$cwd" ] || continue
+    [ "$id" != - ] || id=$(printf '%s' "$locked" | awk -F'\t' -v c="$cwd" '$3==c' | sort -rn | head -1 | cut -f2)
+    [ -n "$id" ] || continue
+    f=$(codex_tx "$id"); [ -n "$f" ] || continue
+    printf '%s\t%s\t%s\t%s\t%s\t%s\tcodex\n' "$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f")000" "$id" "$pid" "$(codex_name "$id" "$cwd")" "$kind" "$cwd"
+  done
+}
+codex_busy() {      # rollout: is a turn still running? (a TUI quitting does not stop it)
+  [ "$(jq -r 'select(.type=="event_msg") | .payload.type | select(test("^(task_started|task_complete|turn_aborted)$"))' "$1" 2>/dev/null | tail -1)" = task_started ]
+}
+codex_wait_idle() { # rollout seconds
+  local i; for i in $(seq 1 "$2"); do codex_busy "$1" || return 0; sleep 1; done; return 1
+}
+codex_name() {      # thread name if one was set, else the folder name
+  local n; n=$(grep -F "\"$1\"" "$CXH/session_index.jsonl" 2>/dev/null | tail -1 | jq -r '.thread_name // empty' 2>/dev/null)
+  printf '%s' "${n:-$(basename "$2")}" | tr '\t' ' '
+}
+
 # --- session lookup (laptop) -------------------------------------------------
-live_sessions() {   # sid<TAB>pid<TAB>name<TAB>status<TAB>cwd, newest first
-  for f in "$HOME"/.claude/sessions/*.json; do
-    [ -e "$f" ] || continue
-    jq -r '[.updatedAt // 0, .sessionId, .pid, (.name // "-"), (.status // "-"), .cwd] | @tsv' "$f" 2>/dev/null
-  done | while IFS=$'\t' read -r upd sid pid name status cwd; do
-    kill -0 "$pid" 2>/dev/null && printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$upd" "$sid" "$pid" "$name" "$status" "$cwd"
-  done | sort -rn | cut -f2-
+live_sessions() {   # sid<TAB>pid<TAB>name<TAB>status<TAB>cwd<TAB>agent, newest first
+  { for f in "$HOME"/.claude/sessions/*.json; do
+      [ -e "$f" ] || continue
+      jq -r '[.updatedAt // 0, .sessionId, .pid, (.name // "-"), (.status // "-"), .cwd] | @tsv' "$f" 2>/dev/null
+    done | while IFS=$'\t' read -r upd sid pid name status cwd; do
+      kill -0 "$pid" 2>/dev/null && printf '%s\t%s\t%s\t%s\t%s\t%s\tclaude\n' "$upd" "$sid" "$pid" "$name" "$status" "$cwd"
+    done
+    codex_live
+  } | sort -rn | cut -f2-
+}
+
+is_self() {         # sid pid: is this the session that runs us?
+  [ "$1" = "${CLAUDE_CODE_SESSION_ID:-}" ] || [ "$1" = "${CODEX_THREAD_ID:-}" ] || { [ -n "$2" ] && is_ancestor "$2"; }
 }
 
 resolve_sid() {     # accepts a session id, id prefix, session name, or "self"
   local a=$1 hit
-  if [ "$a" = self ]; then   # the Claude Code session whose Bash tool (or ! prompt) runs us
+  if [ "$a" = self ]; then   # the Claude Code or Codex session whose tool call (or ! prompt) runs us
+    [ -n "${CODEX_THREAD_ID:-}" ] && [ -n "$(codex_tx "$CODEX_THREAD_ID")" ] && { echo "$CODEX_THREAD_ID"; return; }
     hit=$(live_sessions | while IFS=$'\t' read -r s p _; do
-      if [ "$s" = "${CLAUDE_CODE_SESSION_ID:-}" ] || is_ancestor "$p"; then echo "$s"; break; fi
+      if is_self "$s" "$p"; then echo "$s"; break; fi
     done)
     [ -n "$hit" ] && { echo "$hit"; return; }
-    die "self: not running inside a live Claude Code session"
+    die "self: not running inside a live Claude Code or Codex session"
   fi
-  hit=$(live_sessions | awk -F'\t' -v a="$a" '$1==a || $3==a || index($1,a)==1 {print $1}' | head -2)
+  hit=$(live_sessions | awk -F'\t' -v a="$a" '{ s = substr($1, 1, 8) "-" substr($1, length($1) - 3) }
+    $1==a || $3==a || index($1,a)==1 || s==a {print $1}' | sort -u | head -2)
   [ "$(printf '%s\n' "$hit" | grep -c .)" -gt 1 ] && die "'$a' matches more than one session"
   [ -n "$hit" ] && { echo "$hit"; return; }
-  ls "$HOME"/.claude/projects/*/"$a".jsonl >/dev/null 2>&1 && { echo "$a"; return; }
+  agent_of "$a" >/dev/null && { echo "$a"; return; }
   die "no session matches '$a' (try: handoff list)"
 }
 
@@ -91,34 +310,58 @@ resolve_sid() {     # accepts a session id, id prefix, session name, or "self"
 cmd_out() {
   local force=0 sids=() s
   for a in "$@"; do
-    if [ "$a" = --force ]; then force=1; else s=$(resolve_sid "$a") || exit 1; sids+=("$s"); fi
+    case "$a" in
+      --force) force=1 ;;
+      --dry-run) DRY=1 ;;
+      --yes) YES=1 ;;
+      *) s=$(resolve_sid "$a") || exit 1; sids+=("$s") ;;
+    esac
   done
   [ ${#sids[@]} -gt 0 ] || die "usage: handoff out <sid|name|self>... [--force]"
   if [ "$force" = 0 ]; then   # each session is ~0.5 GB on the remote
     local have; have=$(ls "$STATE/out" | grep -c . || true)
     [ $(( have + ${#sids[@]} )) -gt "${HANDOFF_MAX_SESSIONS:-8}" ] && die "$HOST would run $(( have + ${#sids[@]} )) sessions (limit HANDOFF_MAX_SESSIONS=${HANDOFF_MAX_SESSIONS:-8}); hand off fewer or pass --force"
   fi
+  local agents="" ag
+  for sid in "${sids[@]}"; do ag=$(agent_of "$sid") || die "no transcript for $sid"; [[ "$agents" == *"$ag"* ]] || agents+=" $ag"; done
+  if [ "${HANDOFF_SKILLS_CHECK:-1}" = 1 ]; then for ag in $agents; do skills_drift "$ag"; done; fi
   BATCH=" ${sids[*]} "   # sessions handed out together may share a tree
   local ordered=() me="" p
   for sid in "${sids[@]}"; do
-    p=$(live_sessions | awk -F'\t' -v s="$sid" '$1==s {print $2}')
-    if [ -n "$p" ] && is_ancestor "$p"; then me=$sid; else ordered+=("$sid"); fi
+    p=$(live_sessions | awk -F'\t' -v s="$sid" '$1==s {print $2}' | head -1)
+    if is_self "$sid" "$p"; then me=$sid; else ordered+=("$sid"); fi
   done
   [ -n "$me" ] && ordered+=("$me")   # the calling session goes last: stopping it ends this run
   for sid in "${ordered[@]}"; do out_one "$sid" "$force"; done
-  log "done. Open the Claude app on your phone; sessions show under Remote Control."
+  [ "$DRY" = 1 ] && { log "dry run: nothing was stopped or sent"; return; }
+  [ "${HANDOFF_MAX_AGE_DAYS:-30}" -gt 0 ] && [ -n "$R_ROOT" ] && prune_remote "${HANDOFF_MAX_AGE_DAYS:-30}" 0
+  [[ "$agents" == *claude* ]] && log "done. Open the Claude app on your phone; Claude sessions show under Remote Control."
+  [[ "$agents" == *codex* ]] && log "done. Codex sessions run in tmux on $HOST (handoff status; handoff wait)."
+  return 0
 }
 
 out_one() {
-  local sid=$1 force=$2 row pid="" name cwd tx root common="" mroot mcommon=""
+  local sid=$1 force=$2 row pid="" p name cwd tx root common="" mroot mcommon="" agent
   [ -e "$STATE/out/$sid" ] && die "$sid is already on $HOST (handoff in $sid first)"
-  tx=$(ls "$HOME"/.claude/projects/*/"$sid".jsonl 2>/dev/null | head -1)
-  [ -n "$tx" ] || die "no transcript for $sid"
+  agent=$(agent_of "$sid") || die "no transcript for $sid"
+  tx=$("${agent}_tx" "$sid")
   row=$(live_sessions | awk -F'\t' -v s="$sid" '$1==s' | head -1)
   if [ -n "$row" ]; then
-    IFS=$'\t' read -r _ pid name _ cwd <<<"$row"
+    IFS=$'\t' read -r _ pid name _ cwd _ <<<"$row"
+  elif [ "$agent" = codex ]; then
+    cwd=$(codex_cwd "$tx"); name=$(codex_name "$sid" "$cwd")
   else
     cwd=$(jq -r 'select(.cwd) | .cwd' "$tx" | tail -1); name="-"
+  fi
+  if [ "$agent" = codex ] && [ -n "$row" ]; then   # a Codex session can have several windows: stop them all
+    local mine=""
+    pid=$(live_sessions | awk -F'\t' -v s="$sid" '$1==s {print $2}' | xargs)
+    if [ "$(codex_clients | awk -F'\t' -v c="$cwd" '$3=="-" && $4==c' | grep -c .)" -gt 1 ]; then
+      # windows started without an id in one folder: we cannot tell which is ours
+      for p in $pid; do ps -o args= -p "$p" | tr ' ' '\n' | grep -qx "$sid" && mine+=" $p"; done
+      [ "$(echo $mine)" = "$pid" ] || log "  several Codex windows work in $cwd; close the ones for $sid yourself"
+      pid=$(echo $mine)
+    fi
   fi
   [ "$name" = "-" ] && name=$(basename "$cwd")
   [ -d "$cwd" ] || die "working directory $cwd is gone"
@@ -133,35 +376,48 @@ out_one() {
   fi
   if [ "$force" = 0 ]; then   # another live laptop session in the same tree would be overwritten on `in`
     local other mygc; mygc=$(git_common "$root")
-    other=$(live_sessions | while IFS=$'\t' read -r s _ n _ c; do
+    other=$(live_sessions | while IFS=$'\t' read -r s _ n _ c _; do
       if [[ "$BATCH" == *" $s "* ]]; then continue; fi
       rc=$(cd "$c" 2>/dev/null && pwd -P) || continue
-      if [[ "$rc/" == "$root"/* ]]; then printf '%s (%s) ' "$n" "${s:0:8}"; continue; fi
-      if [ -n "$mygc" ] && [ "$(git_common "$rc")" = "$mygc" ]; then printf '%s (%s, same repo) ' "$n" "${s:0:8}"; fi
+      if [[ "$rc/" == "$root"/* ]]; then printf '%s (%s) ' "$n" "$(sid8 "$s")"; continue; fi
+      if [ -n "$mygc" ] && [ "$(git_common "$rc")" = "$mygc" ]; then printf '%s (%s, same repo) ' "$n" "$(sid8 "$s")"; fi
     done)
     [ -n "$other" ] && die "other live sessions work inside $root: $other-- hand them out together, stop them, or pass --force"
   fi
-  if [ "$force" = 0 ]; then
-    local kb; kb=$(du -sk "$root" 2>/dev/null | cut -f1)
-    [ "$kb" -gt $(( ${HANDOFF_MAX_GB:-5} * 1024 * 1024 )) ] && die "$root is $((kb/1024/1024)) GB; pass --force to sync it anyway"
-  fi
+  map_tree "$root" "$common"
   mroot=$(mfwd "$root"); [ -n "$common" ] && mcommon=$(mfwd "$common")
+  tree_filter "$root"
 
   log "$name ($sid)"
-  if [ -n "$pid" ] && is_ancestor "$pid"; then   # handing off the session that ran us: finish detached
+  if [ "$agent" = codex ] && [ "$DRY" = 0 ] && ! is_self "$sid" "$pid" && ! codex_wait_idle "$tx" "${HANDOFF_BUSY_WAIT:-30}"; then
+    [ "$force" = 1 ] || die "$name is in the middle of a turn; wait for it, interrupt it (Esc), or pass --force"
+  fi
+  [ "$force" = 1 ] && [ "$YES" = 0 ] && YES=1   # --force skips every guard, size included
+  check_size "$root" "$mroot"
+  if [ "$DRY" = 1 ]; then
+    log "  $root -> $HOST:$mroot"
+    [ -f "$root/.handoff/HANDOFF.md" ] && log "  .handoff/HANDOFF.md found: the remote session starts on it" \
+      || log "  no .handoff/HANDOFF.md: the remote session resumes idle"
+    return 0
+  fi
+  if git -C "$root" rev-parse --is-inside-work-tree >/dev/null 2>&1; then   # notes stay out of commits
+    local ex; ex=$(git -C "$root" rev-parse --path-format=absolute --git-path info/exclude)
+    mkdir -p "$(dirname "$ex")"; grep -qx '/.handoff/' "$ex" 2>/dev/null || echo '/.handoff/' >> "$ex"
+  fi
+  [ -f "$root/.handoff/FINISH.md" ] && mv "$root/.handoff/FINISH.md" "$root/.handoff/FINISH.prev.md"
+  if is_self "$sid" "$pid"; then   # handing off the session that ran us: finish detached
     log "  this is the current session; it stops in a few seconds and resumes on $HOST"
     log "  progress: $STATE/log/$sid.log"
     # own session (setsid) so stopping the parent claude does not take us with it; detach
     # before the slow sync so a Bash tool call returns at once and its result is saved
-    HANDOFF_DETACHED=1 nohup python3 -c 'import os,sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
-      "$0" _out_finish "$sid" "$pid" "$name" "$cwd" "$root" "$common" "$tx" \
-      </dev/null >"$STATE/log/$sid.log" 2>&1 &
-    disown; return
+    HANDOFF_DETACHED=1 detach nohup "$0" _out_finish "$sid" "$pid" "$name" "$cwd" "$root" "$common" "$tx" "$agent" \
+      </dev/null >"$STATE/log/$sid.log" 2>&1
+    return
   fi
   log "  sync $root -> $HOST:$mroot (warm copy, session still running)"
   sync_to_remote "$root" "$mroot" "$common" "$mcommon"
-  [ -n "$pid" ] && stop_pid "$pid"
-  finish_out "$sid" "$name" "$cwd" "$root" "$common" "$tx"
+  for p in $pid; do stop_pid "$p"; done
+  finish_out "$sid" "$name" "$cwd" "$root" "$common" "$tx" "$agent"
 }
 
 git_common() {      # real path of the shared .git, or nothing outside git
@@ -190,11 +446,11 @@ stop_pid() {
 
 sync_to_remote() {  # root mroot common mcommon
   msh "mkdir -p $(printf %q "$2")"
-  rsync -a --delete "${EXCLUDES[@]}" "$1/" "$HOST:$2/"
+  rsync -a --copy-unsafe-links --delete "${FILTER[@]}" "$1/" "$HOST:$2/"
   if [ -n "$3" ]; then   # git worktree: copy the shared .git and repoint the links
     msh "mkdir -p $(printf %q "$4")"
     rsync -a --delete "$3/" "$HOST:$4/"
-    msh "bash -s" <<EOF
+    mshi "bash -s" <<EOF
 $(declare -p FWD); $(declare -f fwd)
 f=$(printf %q "$2/.git"); [ -f "\$f" ] && { fwd < "\$f" > "\$f.tmp" && mv "\$f.tmp" "\$f"; }
 for g in $(printf %q "$4")/worktrees/*/gitdir; do [ -f "\$g" ] && { fwd < "\$g" > "\$g.tmp" && mv "\$g.tmp" "\$g"; }; done
@@ -202,8 +458,8 @@ EOF
   fi
 }
 
-finish_out() {      # sid name cwd root common tx
-  local sid=$1 name=$2 cwd=$3 root=$4 common=$5 tx=$6 mcwd mroot mcommon="" mtxdir sess
+finish_out() {      # sid name cwd root common tx agent
+  local sid=$1 name=$2 cwd=$3 root=$4 common=$5 tx=$6 agent=${7:-claude} mcwd mroot mcommon="" sess
   local rcwd mrcwd sh=${HANDOFF_REMOTE_SHELL:-zsh}
   mcwd=$(mfwd "$cwd"); mroot=$(mfwd "$root"); [ -n "$common" ] && mcommon=$(mfwd "$common")
   rcwd=$(cd "$cwd" && pwd -P); mrcwd=$(mfwd "$rcwd")
@@ -218,36 +474,91 @@ finish_out() {      # sid name cwd root common tx
       || die "cannot recreate $mcwd on $HOST; move it aside there and run: handoff out $sid --force"
   fi
 
-  mtxdir=$R_HOME/.claude/projects/$(enc "$mcwd")
-  log "  transcript -> $HOST:$mtxdir"
-  msh "mkdir -p $(printf %q "$mtxdir")"
-  fwd < "$tx" | msh "cat > $(printf %q "$mtxdir/$sid.jsonl")"
-  if [ -d "${tx%.jsonl}" ]; then   # subagent transcripts
-    find "${tx%.jsonl}" -type f | while read -r f; do
-      rel=${f#"${tx%.jsonl}"/}
-      msh "mkdir -p $(printf %q "$mtxdir/$sid/$(dirname "$rel")")"
-      fwd < "$f" | msh "cat > $(printf %q "$mtxdir/$sid/$rel")"
-    done
+  local cmd m="" e="" extra=""
+  "${agent}_send" "$sid" "$tx" "$mcwd" "$mrcwd" "$mroot"
+  touch_stamp "$mroot"
+
+  # with a handoff note the remote gets to work at once; without one it waits for you
+  local prompt=""
+  if [ -f "$root/.handoff/HANDOFF.md" ]; then
+    prompt="This session was handed off from the laptop to $HOST so it can go on while the laptop is offline. Read .handoff/HANDOFF.md in $mroot and continue the task. Do not git push, fetch, or change remotes; commit locally only if HANDOFF.md allows it. The user is probably not watching: do not stop to ask unless truly blocked; make reasonable choices and record them. When done or blocked, write .handoff/FINISH.md: status (done / partial / blocked), what changed (files, commits), how you verified it, decisions you made, open questions, missing inputs, and the suggested next step."
   fi
-  [ -d "$HOME/.claude/file-history/$sid" ] && rsync -a "$HOME/.claude/file-history/$sid" "$HOST:.claude/file-history/"
-
-  # trust the folder so the session does not wait on a dialog nobody can see
-  msh "f=~/.claude.json; [ -f \$f ] || echo '{}' > \$f; jq --arg p $(printf %q "$mcwd") --arg r $(printf %q "$mrcwd") '.projects[\$p].hasTrustDialogAccepted = true | .projects[\$r].hasTrustDialogAccepted = true' \$f > \$f.tmp && mv \$f.tmp \$f"
-
-  sess="ho-${sid:0:8}"
-  log "  start on $HOST: tmux $sess, Remote Control name '$name'"
+  sess="ho-$(sid8 "$sid")"
+  "${agent}_cmd" "$sid" "$tx" "$mcwd" "$name" "$prompt"   # sets cmd m e
+  log "  start on $HOST: tmux $sess${m:+, model $m}${e:+ ($e)}"
   msh "tmux kill-session -t $sess 2>/dev/null; tmux new-session -d -s $sess -x 200 -y 50 -c $(printf %q "$mcwd") \
-    $sh -lc $(printf %q "cd $(printf %q "$mcwd") && claude --resume $sid --remote-control $(printf %q "$name") ${HANDOFF_CLAUDE_ARGS:-}; exec $sh -l")"
+    $sh -lc $(printf %q "export PATH=\$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:\$PATH; cd $(printf %q "$mcwd") && $cmd; exec $sh -l")"
 
-  printf 'SID=%q\nNAME=%q\nCWD=%q\nROOT=%q\nCOMMON=%q\nTX=%q\nTMUX=%q\nAT=%q\nTREE=%q\n' \
-    "$sid" "$name" "$cwd" "$root" "$common" "$tx" "$sess" "$(date -u +%FT%TZ)" "$(tree_state "$root")" > "$STATE/out/$sid"
+  local links; links=$(outside_links "$root" | while IFS= read -r l; do printf '%q ' "$l"; done)
+  printf 'SID=%q\nNAME=%q\nCWD=%q\nROOT=%q\nCOMMON=%q\nTX=%q\nTMUX=%q\nAT=%q\nTREE=%q\nMROOT=%q\nLINKS=(%s)\nAGENT=%q\nTXSUM=%q\nTXLINES=%q\n' \
+    "$sid" "$name" "$cwd" "$root" "$common" "$tx" "$sess" "$(date -u +%FT%TZ)" "$(tree_state "$root")" "$mroot" "$links" "$agent" \
+    "$(shasum < "$tx" | cut -c1-16)" "$(wc -l < "$tx" | tr -d ' ')" > "$STATE/out/$sid"
 
-  sleep 6
+  sleep "${HANDOFF_START_WAIT:-6}"   # a crash at start shows within seconds
   if msh "tmux has-session -t $sess" 2>/dev/null; then
     log "  running on $HOST. Watch it from the laptop: ssh -t $HOST tmux attach -t $sess"
   else
     die "tmux session $sess died on $HOST; see: ssh $HOST"
   fi
+}
+
+# Per agent: <agent>_send copies the transcript and trusts the folder on the remote;
+# <agent>_cmd sets cmd (the remote command line), m and e (model, effort).
+claude_send() {     # sid tx mcwd mrcwd mroot
+  local sid=$1 tx=$2 mtxdir
+  mtxdir=$R_HOME/.claude/projects/$(enc "$3")
+  log "  transcript -> $HOST:$mtxdir"
+  msh "mkdir -p $(printf %q "$mtxdir")"
+  fwd < "$tx" | mshi "cat > $(printf %q "$mtxdir/$sid.jsonl")"
+  if [ -d "${tx%.jsonl}" ]; then   # subagent transcripts
+    find "${tx%.jsonl}" -type f | while read -r f; do
+      rel=${f#"${tx%.jsonl}"/}
+      msh "mkdir -p $(printf %q "$mtxdir/$sid/$(dirname "$rel")")"
+      fwd < "$f" | mshi "cat > $(printf %q "$mtxdir/$sid/$rel")"
+    done
+  fi
+  [ -d "$HOME/.claude/file-history/$sid" ] && rsync -a "$HOME/.claude/file-history/$sid" "$HOST:.claude/file-history/"
+  # trust the folder so the session does not wait on a dialog nobody can see
+  msh "f=~/.claude.json; [ -f \$f ] || echo '{}' > \$f; jq --arg p $(printf %q "$3") --arg r $(printf %q "$4") '.projects[\$p].hasTrustDialogAccepted = true | .projects[\$r].hasTrustDialogAccepted = true' \$f > \$f.tmp && mv \$f.tmp \$f"
+}
+claude_cmd() {      # sid tx mcwd name prompt; keeps the model and effort the session ran with
+  local x=""
+  case " ${HANDOFF_CLAUDE_ARGS:-} " in *" --model "*) ;; *)
+    m=$(grep -o '"model":"claude-[^"]*"' "$2" | tail -1 | cut -d'"' -f4)
+    [ -n "$m" ] && x+=" --model $(printf %q "$m")" ;; esac
+  case " ${HANDOFF_CLAUDE_ARGS:-} " in *" --effort "*) ;; *)
+    e=$(grep -o '"effort":"[a-z]*"' "$2" | tail -1 | cut -d'"' -f4)
+    [ -n "$e" ] && x+=" --effort $e" ;; esac
+  [ -n "$5" ] && x+=" $(printf %q "$5")"
+  cmd="claude --resume $1 --remote-control $(printf %q "$4") ${HANDOFF_CLAUDE_ARGS:-}$x"
+}
+codex_send() {      # sid tx mcwd mrcwd mroot
+  local rel=${2#"$CXH"/} p
+  for p in "$3" "$4" "$5"; do case "$p" in *'"'*|*'\'*) die "Codex cannot trust a path with \" or \\ in it: $p" ;; esac; done
+  log "  rollout -> $HOST:~/.codex/$rel"
+  msh "mkdir -p ~/.codex/$(printf %q "$(dirname "$rel")")"
+  fwd < "$2" | mshi "cat > ~/.codex/$(printf %q "$rel")"
+  # a persisted trust entry is the only thing that skips the folder dialog (-c does not)
+  mshi "bash -s -- $(printf %q "$3") $(printf %q "$4") $(printf %q "$5")" <<'EOF'
+f=~/.codex/config.toml; touch "$f"
+for p in "$@"; do
+  grep -qxF "[projects.\"$p\"]" "$f" || printf '\n[projects."%s"]\ntrust_level = "trusted"\n' "$p" >> "$f"
+done
+EOF
+}
+codex_cmd() {       # sid tx mcwd name prompt
+  local x="" ctx
+  ctx=$(jq -c 'select(.type=="turn_context") | .payload | {model, effort}' "$2" 2>/dev/null | tail -1)
+  case " ${HANDOFF_CODEX_ARGS:-} " in *" -m "*|*" --model "*) ;; *)
+    m=$(printf '%s' "$ctx" | jq -r '.model // empty' 2>/dev/null)
+    [ -n "$m" ] && x+=" -m $(printf %q "$m")" ;; esac
+  case " ${HANDOFF_CODEX_ARGS:-} " in *model_reasoning_effort*) ;; *)
+    e=$(printf '%s' "$ctx" | jq -r '.effort // empty' 2>/dev/null)
+    [ -n "$e" ] && x+=" -c $(printf %q "model_reasoning_effort=\"$e\"")" ;; esac
+  # --no-daemon: the thread lives in this process, so killing the tmux ends it
+  cmd="codex resume --no-daemon -C $(printf %q "$3") ${HANDOFF_CODEX_ARGS:-}$x $1"
+  [ -n "$5" ] && cmd+=" $(printf %q "$5")"
+  return 0
 }
 
 # --- in ----------------------------------------------------------------------
@@ -261,8 +572,7 @@ cmd_in() {
   [ ${#sids[@]} -gt 0 ] || { log "nothing is on $HOST"; return; }
   local cmds=() c
   for a in "${sids[@]}"; do
-    local f; f=$(ls "$STATE"/out/"$a"* 2>/dev/null | head -1)
-    [ -n "$f" ] || die "$a is not on $HOST (handoff status)"
+    local f; f=$(out_file "$a") || die "$a is not on $HOST (handoff status)"
     c=$(in_one "$f") || exit 1; cmds+=("$c")
   done
   log "back on the laptop. Resume with:"
@@ -270,22 +580,30 @@ cmd_in() {
 }
 
 in_one() {          # prints the resume command on stdout; progress on stderr
-  local SID NAME CWD ROOT COMMON TX TMUX AT TREE="" mroot mcommon="" bk mtx mcwd
+  local SID NAME CWD ROOT COMMON TX TMUX AT TREE="" MROOT="" LINKS=() AGENT=claude TXSUM="" TXLINES=0 mroot mcommon="" bk mtx mcwd
   # shellcheck disable=SC1090
   . "$1"
+  map_tree "$ROOT" "$COMMON"; tree_filter "$ROOT"
+  local l; for l in ${LINKS[@]+"${LINKS[@]}"}; do FILTER=(--exclude="$l" "${FILTER[@]}"); done   # keep laptop links
   if [ "${HANDOFF_FORCE:-0}" = 0 ] && git -C "$ROOT" rev-parse HEAD >/dev/null 2>&1 && [ "$(tree_state "$ROOT")" != "$TREE" ]; then
     die "$ROOT changed on the laptop while $NAME was on $HOST; syncing back would overwrite it. Commit/stash or pass --force"
   fi
+  if [ "${HANDOFF_FORCE:-0}" = 0 ] && [ -n "$TXSUM" ] && [ -f "$TX" ] && [ "$(shasum < "$TX" | cut -c1-16)" != "$TXSUM" ]; then
+    die "the laptop transcript of $NAME changed while it was on $HOST (was it resumed here?); syncing back would overwrite it. Pass --force to take the remote one"
+  fi
   mcwd=$(mfwd "$CWD"); mroot=$(mfwd "$ROOT"); [ -n "$COMMON" ] && mcommon=$(mfwd "$COMMON")
-  bk=$STATE/backup/$(date +%Y%m%d-%H%M%S)-${SID:0:8}
+  bk=$STATE/backup/$(date +%Y%m%d-%H%M%S)-$(sid8 "$SID")
   log "$NAME ($SID)" >&2
   log "  stopping tmux $TMUX on $HOST" >&2
-  msh "tmux kill-session -t $TMUX 2>/dev/null; for i in \$(seq 1 20); do pgrep -f 'resume $SID' >/dev/null || exit 0; sleep 0.5; done; pkill -9 -f 'resume $SID'; true"
+  msh "tmux kill-session -t $TMUX 2>/dev/null; for i in \$(seq 1 20); do pgrep -f '[r]esume.* $SID' >/dev/null || break; sleep 0.5; done; pkill -9 -f '[r]esume.* $SID'; true"   # [r]: not this shell's own args
 
   log "  sync $HOST:$mroot -> $ROOT (replaced files kept in $bk)" >&2
-  rsync -a --delete --backup --backup-dir="$bk/root" "${EXCLUDES[@]}" "$HOST:$mroot/" "$ROOT/" >&2
+  # in_one runs inside $(...) || exit, where set -e is off: check each step by hand
+  rsync -a --delete --backup --backup-dir="$bk/root" "${FILTER[@]}" "$HOST:$mroot/" "$ROOT/" >&2 \
+    || die "sync back of $ROOT failed; the session stays on $HOST (tmux stopped). Fix it and run: handoff in $SID"
   if [ -n "$COMMON" ]; then
-    rsync -a --delete --backup --backup-dir="$bk/common" "$HOST:$mcommon/" "$COMMON/" >&2
+    rsync -a --delete --backup --backup-dir="$bk/common" "$HOST:$mcommon/" "$COMMON/" >&2 \
+      || die "sync back of $COMMON failed; the session stays on $HOST. Fix it and run: handoff in $SID"
     [ -f "$ROOT/.git" ] && { back < "$ROOT/.git" > "$ROOT/.git.tmp" && mv "$ROOT/.git.tmp" "$ROOT/.git"; }
     for g in "$COMMON"/worktrees/*/gitdir; do [ -f "$g" ] && { back < "$g" > "$g.tmp" && mv "$g.tmp" "$g"; }; done
   fi
@@ -299,12 +617,27 @@ in_one() {          # prints the resume command on stdout; progress on stderr
     { grep -v '^TREE=' "$o"; printf 'TREE=%q\n' "$(tree_state "$oroot")"; } > "$o.tmp" && mv "$o.tmp" "$o"
   done
 
+  mkdir -p "$bk"; cp -p "$TX" "$bk/" 2>/dev/null || true
+  "${AGENT}_fetch" || return 1
+  touch_stamp "$mroot"
+  [ -f "$ROOT/.handoff/FINISH.md" ] && { log "  .handoff/FINISH.md:" >&2; sed 's/^/    /' "$ROOT/.handoff/FINISH.md" >&2; }
+
+  rm -f "$1"
+  case $AGENT in
+    codex) printf 'cd %q && codex resume %s' "$CWD" "$SID" ;;
+    *) printf 'cd %q && claude --resume %s' "$CWD" "$SID" ;;
+  esac
+}
+
+# Per agent, inside in_one (sees its locals): copy the transcript back, then drop
+# the remote copy. The tree stays on the remote as a warm mirror.
+claude_fetch() {
   mtx=$R_HOME/.claude/projects/$(enc "$mcwd")/$SID.jsonl
   msh "test -f $(printf %q "$mtx")" || mtx=$(msh "ls ~/.claude/projects/*/$SID.jsonl 2>/dev/null | head -1")   # resume may file it elsewhere
   [ -n "$mtx" ] || die "transcript for $SID not found on $HOST; nothing synced back for it"
   log "  transcript <- $HOST" >&2
-  mkdir -p "$bk"; cp -p "$TX" "$bk/" 2>/dev/null || true
-  msh "cat $(printf %q "$mtx")" | back > "$TX.tmp" && mv "$TX.tmp" "$TX"
+  msh "cat $(printf %q "$mtx")" | back > "$TX.tmp" && [ -s "$TX.tmp" ] && mv "$TX.tmp" "$TX" \
+    || die "could not copy the transcript back; the remote copy is kept. Run: handoff in $SID"
   if msh "test -d $(printf %q "${mtx%.jsonl}")"; then
     msh "cd $(printf %q "${mtx%.jsonl}") && find . -type f" | while read -r rel; do
       mkdir -p "$(dirname "${TX%.jsonl}/$rel")"
@@ -312,9 +645,29 @@ in_one() {          # prints the resume command on stdout; progress on stderr
     done
   fi
   msh "test -d .claude/file-history/$SID" && rsync -a "$HOST:.claude/file-history/$SID" "$HOME/.claude/file-history/" >&2 || true
-
-  rm -f "$1"
-  printf 'cd %q && claude --resume %s' "$CWD" "$SID"
+  msh "rm -rf $(printf %q "$mtx") $(printf %q "${mtx%.jsonl}") .claude/file-history/$SID" || true
+}
+codex_fetch() {
+  mtx=$(msh "ls ~/.codex/sessions/*/*/*/rollout-*-$SID.jsonl 2>/dev/null | head -1")
+  [ -n "$mtx" ] || die "rollout for $SID not found on $HOST; nothing synced back for it"
+  log "  rollout <- $HOST" >&2
+  msh "cat $(printf %q "$mtx")" | back > "$TX.tmp" && [ -s "$TX.tmp" ] && jq -e . "$TX.tmp" >/dev/null \
+    || die "could not copy the rollout back; the remote copy is kept. Run: handoff in $SID"
+  # Keep the laptop's own lines byte for byte (rewriting them out and back is not exact
+  # when they quote a remote path) and append only what the remote added, in place: the
+  # laptop daemon may still hold this file open, and its index uses byte offsets.
+  local n=$TXLINES
+  if [ "$n" -gt 0 ] && [ "$(wc -l < "$TX" | tr -d ' ')" = "$n" ] && [ "$(wc -l < "$TX.tmp" | tr -d ' ')" -ge "$n" ] \
+     && [ "$(sed -n "${n}p" "$TX" | jq -c '[.ordinal, .timestamp]')" = "$(sed -n "${n}p" "$TX.tmp" | jq -c '[.ordinal, .timestamp]')" ]; then
+    tail -n +"$((n + 1))" "$TX.tmp" >> "$TX"; rm -f "$TX.tmp"
+  elif codex_held "$SID" && [ "${HANDOFF_FORCE:-0}" = 0 ]; then
+    rm -f "$TX.tmp"
+    die "the remote rollout of $SID does not extend the laptop one, and the laptop Codex daemon still holds it. Close its Codex windows, run: codex app-server daemon restart, then: handoff in $SID"
+  else
+    mv "$TX.tmp" "$TX"
+  fi
+  # delete through codex so its state db forgets the thread too; the rollout goes with it
+  msh "codex delete --force $SID </dev/null >/dev/null 2>&1 || rm -f $(printf %q "$mtx")" || true
 }
 
 # --- list / status ----------------------------------------------------------
@@ -322,28 +675,246 @@ cmd_status() {
   local any=0
   for f in "$STATE"/out/*; do
     [ -e "$f" ] || continue; any=1
-    ( . "$f"; alive=$(msh "tmux has-session -t $TMUX 2>/dev/null && echo running || echo stopped")
-      printf '%-10s %-28s %-8s since %s  %s\n' "${SID:0:8}" "$NAME" "$alive" "$AT" "$CWD" )
+    ( MROOT="" AGENT=claude; . "$f"; alive=$(msh "tmux has-session -t $TMUX 2>/dev/null && echo running || echo stopped")
+      fin=""; [ -n "$MROOT" ] && msh "test -f $(printf %q "$MROOT/.handoff/FINISH.md")" 2>/dev/null && fin=" [FINISH.md]"
+      printf '%-14s %-6s %-28s %-8s since %s  %s%s\n' "$(sid8 "$SID")" "$AGENT" "$NAME" "$alive" "$AT" "$CWD" "$fin" )
   done
   [ $any = 1 ] || echo "nothing is on $HOST"
 }
 
+remote_done() {     # state file: FINISH.md written and the session idle (or stopped)
+  ( MROOT="" AGENT=claude; . "$1"; [ -n "$MROOT" ] || exit 1
+    mshi "bash -s -- $(printf %q "$MROOT") $AGENT $SID" <<'EOF'
+[ -f "$1/.handoff/FINISH.md" ] || exit 1
+if [ "$2" = codex ]; then
+  f=$(ls ~/.codex/sessions/*/*/*/rollout-*-"$3".jsonl 2>/dev/null | head -1); [ -n "$f" ] || exit 0
+  [ "$(jq -r 'select(.type=="event_msg") | .payload.type | select(test("^(task_started|task_complete|turn_aborted)$"))' "$f" | tail -1)" != task_started ]
+else
+  ! cat ~/.claude/sessions/*.json 2>/dev/null | jq -r --arg s "$3" 'select(.sessionId==$s) | .status' | grep -qx busy
+fi
+EOF
+  )
+}
+
+cmd_wait() {        # block until FINISH.md + idle; laptop offline in between is fine
+  local sids=() timeout=${HANDOFF_WAIT_TIMEOUT:-0} t0 f a pending
+  while [ $# -gt 0 ]; do case "$1" in --timeout) timeout=$2; shift ;; *) sids+=("$1") ;; esac; shift; done
+  if [ ${#sids[@]} -eq 0 ]; then for f in "$STATE"/out/*; do [ -e "$f" ] && sids+=("$(basename "$f")"); done; fi
+  [ ${#sids[@]} -gt 0 ] || die "nothing is on $HOST"
+  t0=$(date +%s)
+  while :; do
+    pending=""
+    for a in "${sids[@]}"; do
+      f=$(out_file "$a") || die "$a is not on $HOST (handoff status)"
+      remote_done "$f" 2>/dev/null || pending+=" $a"
+    done
+    [ -z "$pending" ] && { log "finished on $HOST: ${sids[*]}"; return 0; }
+    if [ "$timeout" -gt 0 ] && [ $(( $(date +%s) - t0 )) -ge "$timeout" ]; then die "still working on $HOST:$pending"; fi
+    sleep "${HANDOFF_WAIT_POLL:-30}"
+  done
+}
+
+# Detached: wait until the session is on the remote (`out` may come right after
+# us), then until it wrote FINISH.md and is idle; bring it back and resume it here.
+# Session variables of the agent that ran `back`. A tmux server keeps the env it
+# started with, so the resumed agent would get a dead session's ID and socket.
+AGENT_ENV="CLAUDECODE CLAUDE_CODE_SESSION_ID CLAUDE_CODE_CHILD_SESSION CLAUDE_CODE_ENTRYPOINT CLAUDE_CODE_EXECPATH
+  CLAUDE_CODE_MESSAGING_SOCKET CLAUDE_CODE_MESSAGING_TOKEN CLAUDE_CODE_SESSION_ATTENDED CLAUDE_PID CLAUDE_EFFORT
+  CODEX_THREAD_ID CODEX_SESSION_ID CODEX_TOOL_CALL_ID"
+cmd_back() {
+  local a="" prompt="" args="" timeout=${HANDOFF_WAIT_TIMEOUT:-0} sid i agent cwd c
+  while [ $# -gt 0 ]; do
+    case "$1" in --prompt) prompt=$2; shift ;; --args) args=$2; shift ;; --timeout) timeout=$2; shift ;; *) a=$1 ;; esac
+    shift
+  done
+  [ -n "$a" ] || die "usage: handoff back <sid|self> [--prompt TEXT] [--args FLAGS] [--timeout S]"
+  if [ -z "${HANDOFF_BACK_CHILD:-}" ]; then
+    command -v tmux >/dev/null || die "handoff back needs tmux on the laptop"
+    sid=$(resolve_sid "$a") || exit 1   # resolve self now, while the session is still here
+    HANDOFF_BACK_CHILD=1 detach nohup "$0" back "$sid" --prompt "$prompt" --args "$args" --timeout "$timeout" \
+      </dev/null >"$STATE/log/back-$sid.log" 2>&1
+    log "watching $sid: once done on $HOST it comes back and resumes in tmux ho-back-$(sid8 "$sid") (log: $STATE/log/back-$sid.log)"
+    return 0
+  fi
+  sid=$a
+  unset $AGENT_ENV
+  for i in $(seq 1 600); do [ -e "$STATE/out/$sid" ] && break; sleep 1; done
+  [ -e "$STATE/out/$sid" ] || die "$sid did not go to $HOST within 10 minutes"
+  cmd_wait "$sid" --timeout "$timeout"
+  agent=$(. "$STATE/out/$sid"; echo "${AGENT:-claude}"); cwd=$(. "$STATE/out/$sid"; echo "$CWD")
+  need_rsync3; setup_paths
+  cmd_in "$sid"
+  case $agent in
+    codex) c="codex resume -C $(printf %q "$cwd") $args $sid" ;;
+    *) c="claude --resume $sid $args" ;;
+  esac
+  [ -n "$prompt" ] && c+=" $(printf %q "$prompt")"
+  # no TMUX: a Codex daemon started inside some tmux passes that socket to its commands
+  env -u TMUX tmux new-session -d -s "ho-back-$(sid8 "$sid")" -x 200 -y 50 -c "$cwd" "unset $(echo $AGENT_ENV); $c; exec \$SHELL -l"
+  log "resumed here: tmux attach -t ho-back-$(sid8 "$sid")"
+}
+
+# --- mirrors ---------------------------------------------------------------------
+# Root mode keeps each synced tree on the remote after `in`, so the next `out` only
+# sends changes. $R_ROOT/.last-used/<key> holds the mirror path; its mtime is the last
+# out/in. prune removes mirrors older than N days unless a process still works in them.
+touch_stamp() { [ -n "$R_ROOT" ] || return 0; msh "mkdir -p $(printf %q "$R_ROOT/.last-used") && printf %s $(printf %q "$1") > $(printf %q "$R_ROOT/.last-used/$(mirror_key "$1")")"; }
+
+prune_remote() {    # days (0 = list only) dry
+  mshi "bash -s -- $(printf %q "$R_ROOT") $1 $2" <<'EOF'
+root=$1 days=$2 dry=$3
+for st in "$root"/.last-used/*; do
+  [ -f "$st" ] || continue
+  m=$(cat "$st")
+  case "$m" in "$root"/?*) ;; *) echo "handoff: skip $st ($m is outside $root)"; continue ;; esac
+  used=$(date -r "$st" +%F 2>/dev/null || stat -f %Sm -t %F "$st")
+  size=$(du -sh "$m" 2>/dev/null | cut -f1)
+  live=""
+  if [ -d /proc/self ]; then
+    for c in /proc/[0-9]*/cwd; do t=$(readlink "$c" 2>/dev/null) || continue; case "$t/" in "$m"/*) live=" [in use]"; break ;; esac; done
+  else
+    lsof -d cwd -Fn 2>/dev/null | grep -q "^n$m" && live=" [in use]"
+  fi
+  if [ "$days" = 0 ]; then printf '  %-56s %6s  last used %s%s\n' "$m" "${size:--}" "$used" "$live"; continue; fi
+  [ -n "$(find "$st" -mtime +"$days")" ] || continue
+  [ -z "$live" ] || { echo "handoff: prune skips $m$live"; continue; }
+  if [ "$dry" = 1 ]; then echo "handoff: would remove $m (${size:--}, last used $used)"; continue; fi
+  rm -rf -- "$m" "$HOME/.claude/projects/$(printf %s "$m" | sed 's/[^a-zA-Z0-9]/-/g')" "$st"
+  f=$HOME/.claude.json
+  [ -f "$f" ] && jq --arg m "$m" '.projects |= ((. // {}) | with_entries(select(.key != $m and (.key | startswith($m + "/") | not))))' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+  f=$HOME/.codex/config.toml   # Codex trust tables of the mirror, with the blank line codex_send put before each
+  [ -f "$f" ] && awk -v a="[projects.\"$m\"]" -v b="[projects.\"$m/" '/^[ \t]*$/ { held = held $0 "\n"; next } /^\[/ { skip = (index($0, a) == 1 || index($0, b) == 1); if (skip) { held = ""; next } } skip && /^[A-Za-z0-9_-]+ *=/ { next } { skip = 0; printf "%s", held; held = ""; print } END { printf "%s", held }' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+  d=$(dirname "$m"); while [ "$d" != "$root" ] && rmdir "$d" 2>/dev/null; do d=$(dirname "$d"); done
+  echo "handoff: removed $m (last used $used)"
+done
+EOF
+}
+
+cmd_mirrors() {
+  [ -n "$R_ROOT" ] || die "root mode is off (HANDOFF_ROOT is empty)"
+  echo "Mirrors in $HOST:$R_ROOT:"; prune_remote 0 0
+}
+
+cmd_prune() {
+  local days=${HANDOFF_MAX_AGE_DAYS:-30}
+  while [ $# -gt 0 ]; do
+    case "$1" in --max-age) days=$2; shift ;; --dry-run) DRY=1 ;; *) die "usage: handoff prune [--max-age N] [--dry-run]" ;; esac
+    shift
+  done
+  [ -n "$R_ROOT" ] || die "root mode is off (HANDOFF_ROOT is empty)"
+  [ "$days" -gt 0 ] || die "max age is 0 (pruning off); pass --max-age N"
+  log "pruning mirrors in $HOST:$R_ROOT unused for more than $days days"
+  prune_remote "$days" "$DRY"
+}
+
+# The remote keeps its own agent home (skills, plugins, rules). Warn, never copy, when
+# it differs from the laptop: a skill the session has not loaded yet is read there.
+skills_drift() {    # claude|codex
+  local list label
+  if [ "${1:-claude}" = codex ]; then
+    label="global rules"
+    list='for b in .codex/skills .agents/skills; do (cd ~/$b 2>/dev/null && for d in */; do [ -f "$d/SKILL.md" ] && printf "%s %s\n" "${d%/}" "$(shasum < "$d/SKILL.md" 2>/dev/null || sha1sum < "$d/SKILL.md")"; done); done | awk "{print \$1, substr(\$2, 1, 12)}" | sort -u
+echo ---
+for f in ~/.codex/AGENTS.md; do [ -f "$f" ] && printf "AGENTS.md:%s\n" "$( (shasum < "$f" 2>/dev/null || sha1sum < "$f") | cut -c1-12)"; done'
+  else
+    label="plugins"
+    list='cd ~/.claude/skills 2>/dev/null && for d in */; do [ -f "$d/SKILL.md" ] && printf "%s %s\n" "${d%/}" "$(shasum < "$d/SKILL.md" 2>/dev/null || sha1sum < "$d/SKILL.md")"; done | awk "{print \$1, substr(\$2, 1, 12)}" | sort
+echo ---
+jq -r ".enabledPlugins // {} | to_entries[] | select(.value) | .key" ~/.claude/settings.json 2>/dev/null | sort'
+  fi
+  local here there hs ts hp tp miss only diff mp op
+  here=$(cd ~ && bash -c "$list"); there=$(printf '%s\n' "$list" | mshi "bash -s") || return 0
+  hs=$(printf '%s\n' "$here" | sed '/^---$/,$d'); ts=$(printf '%s\n' "$there" | sed '/^---$/,$d')
+  hp=$(printf '%s\n' "$here" | sed '1,/^---$/d'); tp=$(printf '%s\n' "$there" | sed '1,/^---$/d')
+  miss=$(comm -23 <(cut -d' ' -f1 <<<"$hs" | sort) <(cut -d' ' -f1 <<<"$ts" | sort) | xargs)
+  only=$(comm -13 <(cut -d' ' -f1 <<<"$hs" | sort) <(cut -d' ' -f1 <<<"$ts" | sort) | xargs)
+  diff=$(comm -23 <(sort <<<"$hs") <(sort <<<"$ts") | cut -d' ' -f1 | grep -vxF -f <(tr ' ' '\n' <<<"$miss") | xargs || true)
+  mp=$(comm -23 <(sort <<<"$hp") <(sort <<<"$tp") | xargs); op=$(comm -13 <(sort <<<"$hp") <(sort <<<"$tp") | xargs)
+  [ -z "$miss$only$diff$mp$op" ] && { log "$1 skills and $label match on $HOST"; return 0; }
+  log "$1 skills/$label differ on $HOST (only matters if the session needs them; sync with your deploy, e.g. deploy-remotes):"
+  [ -n "$miss" ] && log "  skills missing there: $miss"
+  [ -n "$diff" ] && log "  skills changed there: $diff"
+  [ -n "$only" ] && log "  skills only there:    $only"
+  [ -n "$mp" ] && log "  $label differ/off there: $mp"
+  [ -n "$op" ] && log "  $label only there:   $op"
+  return 0
+}
+
+# --- doctor ------------------------------------------------------------------------
+# Proves the setup before a real handoff: laptop tools, ssh, the remote root, and each
+# agent CLI on both ends (version, login, and for Codex the sandbox that will run there).
+cmd_doctor() {
+  local want=${1:-} fails=0 warns=0 ag v lv rv out
+  ok() { printf '  ok    %s\n' "$*"; }
+  warn() { printf '  WARN  %s\n' "$*"; warns=$((warns + 1)); }
+  bad() { printf '  FAIL  %s\n' "$*"; fails=$((fails + 1)); }
+  echo "laptop:"
+  ok "bash $BASH_VERSION"
+  v=$(rsync --version 2>&1 || true); v=${v%%$'\n'*}
+  [[ "$v" =~ ^rsync\ +version\ 3\. ]] && ok "$v" || bad "rsync 3.x needed, $(command -v "${HANDOFF_RSYNC:-rsync}") is '$v' (brew install rsync, or set HANDOFF_RSYNC)"
+  for v in jq git python3 ssh shasum; do command -v $v >/dev/null && ok "$v" || bad "$v missing"; done
+  [ -n "$HOST" ] || { bad "HANDOFF_HOST is not set in $CONFIG"; echo "RESULT: FAIL"; return 1; }
+  echo "remote ($HOST):"
+  if ! out=$(msh 'printf %s "$HOME"' 2>&1); then bad "ssh $HOST: $out"; echo "RESULT: FAIL"; return 1; fi
+  ok "ssh without a prompt, home $out"
+  setup_paths
+  [ -n "$R_ROOT" ] && ok "root $R_ROOT ($(msh "df -Pk $(printf %q "$R_ROOT") | awk 'NR==2 {printf \"%d GB free\", \$4/1048576}'"))" || warn "root mode is off: trees go to the same path under the remote home"
+  for v in tmux jq git rsync "${HANDOFF_REMOTE_SHELL:-zsh}"; do msh "command -v $v" >/dev/null 2>&1 && ok "$v" || bad "$v missing on $HOST"; done
+  if [ -z "$want" ]; then for ag in claude codex; do command -v $ag >/dev/null && want+=" $ag"; done; fi
+  for ag in $want; do
+    echo "$ag:"
+    command -v $ag >/dev/null || { bad "$ag is not installed on the laptop"; continue; }
+    lv=$($ag --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+    rv=$(msh "$ag --version 2>/dev/null" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+    if [ -z "$rv" ]; then bad "$ag is not installed on $HOST (or not on PATH: ~/.local/bin, /opt/homebrew/bin, /usr/local/bin)"; continue; fi
+    [ "$lv" = "$rv" ] && ok "$ag $lv on both" || warn "$ag $lv here, $rv on $HOST; transcripts may not carry over between versions"
+    case $ag in
+      claude)
+        msh "claude auth status 2>/dev/null" | grep -q '"loggedIn": *true' && ok "claude logged in on $HOST" || bad "claude is not logged in on $HOST (run claude there once)" ;;
+      codex)
+        msh "codex login status </dev/null >/dev/null 2>&1" && ok "codex logged in on $HOST" || bad "codex is not logged in on $HOST (codex login there)"
+        if [[ " ${HANDOFF_CODEX_ARGS:-} " == *" --dangerously-bypass-approvals-and-sandbox "* ]]; then
+          ok "sandbox: bypassed by HANDOFF_CODEX_ARGS"
+        elif out=$(msh "cd /tmp && codex sandbox -- true </dev/null 2>&1"); then
+          ok "codex sandbox runs on $HOST"
+        else
+          bad "codex sandbox fails on $HOST: $(printf '%s' "$out" | tail -1). Fix it there, or (only for a host you trust) add --dangerously-bypass-approvals-and-sandbox to HANDOFF_CODEX_ARGS"
+        fi ;;
+    esac
+    [ "${HANDOFF_SKILLS_CHECK:-1}" = 1 ] && skills_drift "$ag" | sed 's/^/  /'
+  done
+  echo; [ $fails = 0 ] && echo "RESULT: OK$([ $warns -gt 0 ] && echo " ($warns warnings)")" || echo "RESULT: FAIL ($fails)"
+  [ $fails = 0 ]
+}
+
 cmd_list() {
   echo "On the laptop (live):"
-  live_sessions | awk -F'\t' '{printf "  %-10s %-28s %-8s %s\n", substr($1,1,8), $3, $4, $5}'
+  live_sessions | awk -F'\t' '{ id = substr($1, 1, 8); if (substr($1, 15, 1) == "7") id = id "-" substr($1, length($1) - 3)
+    printf "  %-14s %-6s %-28s %-8s %s\n", id, $6, $3, $4, $5 }'
   echo; echo "On $HOST:"; cmd_status | sed 's/^/  /'
 }
 
 case "${1:-}" in
   list|ls) [ -n "$HOST" ] || die "set HANDOFF_HOST in $CONFIG"; cmd_list ;;
   status|st) [ -n "$HOST" ] || die "set HANDOFF_HOST in $CONFIG"; cmd_status ;;
-  out) shift; setup_paths; cmd_out "$@" ;;
-  in) shift; setup_paths; cmd_in "$@" ;;
-  _out_finish) shift; setup_paths
+  out) shift; need_rsync3; setup_paths; cmd_out "$@" ;;
+  in) shift; need_rsync3; setup_paths; cmd_in "$@" ;;
+  wait) shift; [ -n "$HOST" ] || die "set HANDOFF_HOST in $CONFIG"; cmd_wait "$@" ;;
+  back) shift; [ -n "$HOST" ] || die "set HANDOFF_HOST in $CONFIG"; cmd_back "$@" ;;
+  doctor) shift; cmd_doctor "$@" ;;
+  mirrors) setup_paths; cmd_mirrors ;;
+  prune) shift; setup_paths; cmd_prune "$@" ;;
+  _out_finish) shift; setup_paths; map_tree "$5" "$6"; tree_filter "$5"
     log "  sync $5 -> $HOST (warm copy, session still running)"
     sync_to_remote "$5" "$(mfwd "$5")" "$6" "$( [ -n "$6" ] && mfwd "$6")"
     sleep "${HANDOFF_SELF_DELAY:-3}"   # let the calling tool call finish and land in the transcript
-    stop_pid "$2"; finish_out "$1" "$3" "$4" "$5" "$6" "$7" ;;
-  _paths) setup_paths; shift; for p in "$@"; do printf '%s -> %s -> %s\n' "$p" "$(mfwd "$p")" "$(mfwd "$p" | back)"; done ;;
-  *) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+    for p in $2; do stop_pid "$p"; done
+    if [ "${8:-claude}" = codex ]; then   # the daemon finishes the turn even with the TUI gone
+      codex_wait_idle "$7" "${HANDOFF_SELF_WAIT:-180}" || die "the Codex turn did not end; the session stays on the laptop"
+    fi
+    finish_out "$1" "$3" "$4" "$5" "$6" "$7" "${8:-claude}" ;;
+  _paths) setup_paths; shift   # a path other than home is treated as a synced tree
+    for p in "$@"; do [ "$p" = "$HOME" ] || map_tree "$p"; done
+    for p in "$@"; do printf '%s -> %s -> %s\n' "$p" "$(mfwd "$p")" "$(mfwd "$p" | back)"; done ;;
+  *) sed -n '2,/^# Config:/p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac

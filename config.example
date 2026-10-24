@@ -1,6 +1,6 @@
 # ~/.config/handoff/config  (sourced by bash)
 
-# ssh host of the always-on Mac. `ssh <host> true` must work without a prompt.
+# ssh host of the always-on remote (macOS or Linux). `ssh <host> true` must work without a prompt.
 HANDOFF_HOST=my-mac-mini
 
 # Path prefixes that differ between the machines, most specific first.
@@ -14,11 +14,55 @@ HANDOFF_HOST=my-mac-mini
 # Extra arguments for claude on the remote.
 # HANDOFF_CLAUDE_ARGS="--permission-mode auto"
 
+# Extra arguments for codex on the remote (`codex resume --no-daemon ... <id>`).
+# Codex's Linux sandbox needs unprivileged user namespaces; when `handoff doctor
+# codex` says the sandbox fails and the host is yours, bypass it:
+# HANDOFF_CODEX_ARGS="--dangerously-bypass-approvals-and-sandbox"
+
+# Seconds `out` waits for a busy Codex session to end its turn (default 30), and
+# for a self-handoff to end its own turn (default 180).
+# HANDOFF_BUSY_WAIT=30
+# HANDOFF_SELF_WAIT=180
+
+# Seconds `out self` waits before it stops the session, so that the tool call that
+# ran it is saved in the transcript (default 3).
+# HANDOFF_SELF_DELAY=3
+
+# Seconds after the remote start before `out` checks that the agent still runs (default 6).
+# HANDOFF_START_WAIT=6
+
+# `handoff wait`: seconds between checks (default 30) and the limit (default 0 = none).
+# HANDOFF_WAIT_POLL=30
+# HANDOFF_WAIT_TIMEOUT=0
+
 # Login shell on the remote (default zsh).
 # HANDOFF_REMOTE_SHELL=zsh
 
 # Most sessions on the remote at once (default 8; each is ~0.5 GB).
 # HANDOFF_MAX_SESSIONS=8
 
-# Refuse to sync a tree bigger than this many GB (default 5; --force skips).
-# HANDOFF_MAX_GB=5
+# Where synced trees go on the remote: <root>/<path relative to the laptop home>.
+# Keeps handoffs off real checkouts that already live on the remote. A leading ~
+# is the remote home. Set it empty to use the same path under the remote home.
+# HANDOFF_ROOT=~/handoff
+
+# Stop when one sync would send more than this many MB (default 500; --yes sends anyway).
+# HANDOFF_WARN_MB=500
+
+# Delete mirrors not used for this many days on `out` (default 30; 0 = never).
+# HANDOFF_MAX_AGE_DAYS=30
+
+# Honour .gitignore files when syncing (default 1). .handoff/filter always applies.
+# HANDOFF_GITIGNORE=1
+
+# Warn on `out` when the remote's skills/plugins differ (default 1).
+# HANDOFF_SKILLS_CHECK=1
+
+# rsync 3.x binary (default: rsync on PATH). macOS's /usr/bin/rsync is openrsync and is refused.
+# HANDOFF_RSYNC=/opt/homebrew/bin/rsync
+
+# Home folder on the remote (default: asked over ssh on each run).
+# HANDOFF_REMOTE_HOME=/home/me
+
+# Laptop state: records of sessions that are out, backups from `in`, and logs (default ~/.handoff).
+# HANDOFF_STATE="$HOME/.handoff"
