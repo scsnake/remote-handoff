@@ -1,30 +1,32 @@
-# handoff
+# remote-handoff
 
-Move live [Claude Code](https://claude.com/claude-code) sessions from your laptop
-to an always-on Mac, keep working from your phone, and move them back when you
-are home.
+Move live [Claude Code](https://claude.com/claude-code) and
+[Codex CLI](https://github.com/openai/codex) sessions from your laptop to an
+always-on remote host (macOS or Linux), let them keep working there, and move
+them back. The session keeps its memory both ways: the transcript, the repo,
+`.git` and the commits made on the remote all come home.
 
-I do most of my work on a laptop and use Claude's Remote Control from my phone
-when I'm out. But I don't want to leave the laptop running in my backpack. So
-before I close it, I hand my sessions off to a Mac mini at home. I pick them up
-on my phone through Remote Control, and when I'm back I hand them off to the
-laptop again.
+Close the laptop while a long task runs, give a job to a stronger machine, or
+pick a Claude Code session up on your phone through Remote Control. The agent
+can also hand itself off: say "I'm heading out", and with `handoff back` it
+returns and resumes on the laptop when the remote part is done.
 
 ```
-laptop                                   Mac mini (always on)
-──────                                   ────────────────────
-handoff out my-session  ───────────────▶ tmux: claude --resume <id> --remote-control
-  stops the session                        ▲
-  syncs repo + .git + transcript           │  Claude app on your phone
-                                           │  (Remote Control)
+laptop                                   remote host (always on)
+──────                                   ───────────────────────
+handoff out my-session  ───────────────▶ tmux: claude --resume <id>
+  stops the session                            or codex resume <id>
+  syncs repo + .git + transcript           works on .handoff/HANDOFF.md,
+                                           or you drive it (Remote Control)
 handoff in  ◀────────────────────────────  stops it, syncs everything back,
-  prints `claude --resume <id>`            commits made there included
+  prints the resume command                commits made there included
 ```
 
-## This fork
+## Origin
 
-A private fork of [zaycruz/claude-handoff](https://github.com/zaycruz/claude-handoff)
-with these additions:
+Based on [zaycruz/claude-handoff](https://github.com/zaycruz/claude-handoff) by
+Zay Cruz (MIT), at commit `def2b14`. That version moves Claude Code sessions
+between macOS machines. This project adds:
 
 - **Remote root.** Trees go to `HANDOFF_ROOT/<path relative to home>` (default
   `~/handoff`), not the same path under the remote home. A handoff can no longer
@@ -141,11 +143,11 @@ restart finish in a detached process a few seconds later.
 
 - Upstream: tested with macOS on both ends over
   [Tailscale SSH](https://tailscale.com/kb/1193/tailscale-ssh), Claude Code 2.1.296.
-  This fork: tested from a Mac laptop to an Ubuntu remote over plain SSH, Claude
-  Code 2.1.310.
+  This project: tested from a Mac laptop to an Ubuntu remote over plain SSH, Claude
+  Code 2.1.310 and Codex CLI 0.164.0.
 - On the laptop: bash, rsync 3.x, jq, git, python3 (for `setsid`) and ssh access
   to the remote without a password prompt. macOS ships openrsync as
-  `/usr/bin/rsync`, which this fork refuses: it ignores the filter rules that keep
+  `/usr/bin/rsync`, which `handoff` refuses: it ignores the filter rules that keep
   `in` from deleting unsent laptop files. Install rsync with `brew install rsync`,
   or point `HANDOFF_RSYNC` at an rsync 3 binary.
 - On the remote: Claude Code installed and logged in to the same account as
@@ -158,19 +160,19 @@ restart finish in a detached process a few seconds later.
 The CLI:
 
 ```sh
-git clone https://github.com/scsnake/claude-handoff ~/claude-handoff
-ln -s ~/claude-handoff/handoff ~/.local/bin/handoff
+git clone https://github.com/scsnake/remote-handoff ~/remote-handoff
+ln -s ~/remote-handoff/handoff ~/.local/bin/handoff
 mkdir -p ~/.config/handoff
-cp ~/claude-handoff/config.example ~/.config/handoff/config   # then set HANDOFF_HOST
+cp ~/remote-handoff/config.example ~/.config/handoff/config   # then set HANDOFF_HOST
 ```
 
 The Claude Code plugin (the `handoff` skill), in Claude Code:
 
 ```
-/plugin install handoff --marketplace scsnake/claude-handoff
+/plugin install handoff --marketplace scsnake/remote-handoff
 ```
 
-Or link the skill by hand: `ln -s ~/claude-handoff/skills/handoff ~/.claude/skills/handoff`.
+Or link the skill by hand: `ln -s ~/remote-handoff/skills/handoff ~/.claude/skills/handoff`.
 
 ## Use
 
@@ -244,7 +246,7 @@ It checks:
 - the laptop-changed guard
 - path rewriting both ways
 - the resumed laptop session remembering what happened on the remote
-- (fork) the remote root, `--dry-run`, an ignored file staying on the laptop, a
+- (added here) the remote root, `--dry-run`, an ignored file staying on the laptop, a
   symlink out of the tree, mirror stamps, and the remote transcript cleanup
 
 ## Limits

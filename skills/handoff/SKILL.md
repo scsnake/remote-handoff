@@ -21,7 +21,7 @@ Before the first real handoff, the user can run `handoff doctor` (setup check) o
 the test protocol in `TEST-PROTOCOL.md` of the handoff repo.
 
 If `handoff` is not on PATH, tell the user to install it from
-https://github.com/zaycruz/claude-handoff and stop.
+https://github.com/scsnake/remote-handoff and stop.
 
 ## Leaving: "I'm heading out", "hand this off"
 
